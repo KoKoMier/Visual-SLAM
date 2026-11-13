@@ -1,0 +1,20 @@
+# Ignored reference repositories, datasets, and generated outputs
+ORB_SLAM3-master/
+data/
+outputs/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
