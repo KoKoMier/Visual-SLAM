@@ -14,11 +14,27 @@ run_phase1_demo.py
    `python run_phase1_demo.py --live --max_frames 60`
 """
 
-from __future__ import annotations
 import argparse
 import os
+import sys
+
+# 自动配置 Conda 环境 (如 C:\Users\14163\miniconda3\envs\hfnet) 下的 Library\bin DLL 路径
+_conda_lib_bin = os.path.join(sys.prefix, "Library", "bin")
+if os.path.isdir(_conda_lib_bin) and _conda_lib_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _conda_lib_bin + os.pathsep + os.environ.get("PATH", "")
+
 import cv2
 import numpy as np
+
+
+def _imwrite_safe(path, img) :
+    """兼容 OpenCV 3.4.2 在含中文路径 (视觉slam) 下的图像保存"""
+    ext = os.path.splitext(path)[1] or ".png"
+    ok, buf = cv2.imencode(ext, img)
+    if ok:
+        buf.tofile(path)
+        return True
+    return False
 
 from src.core.lie_algebra import SE3, log_so3
 from src.core.camera import StereoCamera
@@ -29,7 +45,7 @@ from src.visualizer import FrameVisRecord, SLAMVideoFlowVisualizer, Live3DTrajec
 from src.blackbox_logger import BlackboxLogger, print_blackbox_history
 
 
-def verify_core_operators() -> None:
+def verify_core_operators() :
     """验证 1:1 对齐 C++ 的核心数学与优化算子精度"""
     print("=" * 72)
     print("[Step 1] 开始验证底层核心算子 (1:1 对齐 C++ Eigen / Sophus / g2o)")
@@ -72,11 +88,11 @@ def verify_core_operators() -> None:
 
 
 def _collect_frame_vis_record(
-    slam: SLAMSystem,
-    frame_idx: int,
-    timestamp: float,
-    gt_pos: np.ndarray | None,
-) -> FrameVisRecord:
+    slam,
+    frame_idx,
+    timestamp,
+    gt_pos,
+) :
     """从当前跟踪帧提取用于视频流程图的特征、光流、共视 3D 点与算法状态"""
     cf = slam.tracker.curr_frame
     pf = getattr(slam.tracker, "prev_frame", None)
@@ -85,7 +101,7 @@ def _collect_frame_vis_record(
     kp_uv_list = []
     kp_depth_list = []
     obs_mp_xyz = []
-    curr_mp_to_uv: dict[int, np.ndarray] = {}
+    curr_mp_to_uv = {}
 
     for idx_kp, mp in enumerate(cf.map_points):
         if mp is not None and not mp.is_bad and not cf.outliers[idx_kp]:
@@ -128,7 +144,7 @@ def _collect_frame_vis_record(
     )
 
 
-def _sync_final_poses_to_records(slam: SLAMSystem, records: list[FrameVisRecord]) -> None:
+def _sync_final_poses_to_records(slam, records) :
     """将后端 Local BA / 回环优化后的最终平滑相机位姿同步回视频记录帧"""
     _, poses_wc = slam.get_camera_trajectory()
     for rec, T_wc_final in zip(records, poses_wc):
@@ -136,7 +152,7 @@ def _sync_final_poses_to_records(slam: SLAMSystem, records: list[FrameVisRecord]
         rec.t_wc_raw = T_wc_final.t.copy()
 
 
-def run_synthetic_benchmark(num_frames: int = 80, output_dir: str = "outputs") -> None:
+def run_synthetic_benchmark(num_frames = 80, output_dir = "outputs") :
     os.makedirs(output_dir, exist_ok=True)
     print("\n" + "=" * 72)
     print(f"[Step 2] 运行 3D 闭环双目+IMU SLAM 端到端评测 (共 {num_frames} 帧)")
@@ -161,7 +177,7 @@ def run_synthetic_benchmark(num_frames: int = 80, output_dir: str = "outputs") -
     )
 
     gt_positions = []
-    vis_records: list[FrameVisRecord] = []
+    vis_records = []
 
     for k in range(num_frames):
         T_wc_gt = dataset.gt_poses_wc[k]
@@ -235,7 +251,7 @@ def run_synthetic_benchmark(num_frames: int = 80, output_dir: str = "outputs") -
     print(f"  [黑盒日志归档] 本次运行历史黑盒日志已保存至: {os.path.abspath(bb_dir)}")
 
 
-def run_euroc_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "outputs") -> None:
+def run_euroc_sequence(mav0_dir, max_frames = 150, output_dir = "outputs") :
     os.makedirs(output_dir, exist_ok=True)
     print("\n" + "=" * 72)
     print(f"[EuRoC 真实数据集评测] 加载目录: {mav0_dir}")
@@ -260,7 +276,7 @@ def run_euroc_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "
 
     gt_positions = []
     valid_frame_indices = []
-    vis_records: list[FrameVisRecord] = []
+    vis_records = []
 
     for k in range(n_run):
         img_l, img_r, ts, imus, gt_pos = dataset.get_item(k)
@@ -291,9 +307,13 @@ def run_euroc_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "
     fe_times = np.asarray(slam.tracker.timing_stats["frontend_ms"])
     be_times = np.asarray(slam.tracker.timing_stats["backend_ms"])
     tot_times = np.asarray(slam.tracker.timing_stats["total_ms"])
+    extractor_name = type(slam.tracker.orb_extractor).__name__
+    hfnet_infer_cnt = getattr(slam.tracker.orb_extractor, "inference_count", 0)
 
     print("\n" + "-" * 72)
     print("  [EuRoC 真实无人机数据集评测结果汇总]")
+    print(f"  - Python 运行环境                : {sys.executable}")
+    print(f"  - 前端特征提取模型 (Extractor)   : {extractor_name} (HF-Net 推理次数: {hfnet_infer_cnt})")
     print(f"  - 评测总帧数 (Frames)            : {n_run}")
     print(f"  - 最终活跃关键帧数 (KeyFrames)   : {slam.slam_map.num_keyframes()}")
     print(f"  - 最终活跃 3D 地图点数 (MapPoints): {slam.slam_map.num_mappoints()}")
@@ -361,11 +381,11 @@ def run_euroc_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "
         )
     if sketch_panel is not None:
         sketch_out = os.path.join(output_dir, "euroc_3d_trajectory_sketch.png")
-        cv2.imwrite(sketch_out, sketch_panel)
+        _imwrite_safe(sketch_out, sketch_panel)
         print(f"  [3D简图已保存] 实时 3D 轨迹简图面板  : {os.path.abspath(sketch_out)}")
 
 
-def run_euroc_monocular_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "outputs") -> None:
+def run_euroc_monocular_sequence(mav0_dir, max_frames = 150, output_dir = "outputs") :
     """
     纯单目无 IMU 模式评测:
     仅输入左目 cam0 单张灰度图像与时间戳 (完全屏蔽右目 cam1 与 imu0)，
@@ -395,7 +415,7 @@ def run_euroc_monocular_sequence(mav0_dir: str, max_frames: int = 150, output_di
 
     gt_positions = []
     valid_frame_indices = []
-    vis_records: list[FrameVisRecord] = []
+    vis_records = []
 
     for k in range(n_run):
         img_l, _, ts, _, gt_pos = dataset.get_item(k)
@@ -502,7 +522,7 @@ def run_euroc_monocular_sequence(mav0_dir: str, max_frames: int = 150, output_di
     print(f"  [黑盒日志归档] 本次运行历史黑盒日志已保存至: {os.path.abspath(bb_dir)}")
 
 
-def run_euroc_monocular_inertial_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "outputs") -> None:
+def run_euroc_monocular_inertial_sequence(mav0_dir, max_frames = 150, output_dir = "outputs") :
     """
     单目 + IMU 紧耦合模式评测 (Monocular-Inertial VIO):
     仅输入左目 cam0 单张灰度图像 + 200Hz IMU (屏蔽右目 cam1)，
@@ -532,7 +552,7 @@ def run_euroc_monocular_inertial_sequence(mav0_dir: str, max_frames: int = 150, 
 
     gt_positions = []
     valid_frame_indices = []
-    vis_records: list[FrameVisRecord] = []
+    vis_records = []
 
     for k in range(n_run):
         img_l, _, ts, imus, gt_pos = dataset.get_item(k)
@@ -623,7 +643,7 @@ def run_euroc_monocular_inertial_sequence(mav0_dir: str, max_frames: int = 150, 
         )
     if sketch_panel is not None:
         sketch_out = os.path.join(output_dir, "euroc_mono_imu_3d_trajectory_sketch.png")
-        cv2.imwrite(sketch_out, sketch_panel)
+        _imwrite_safe(sketch_out, sketch_panel)
         print(f"  [3D简图已保存] 单目+IMU 3D 轨迹简图面板: {os.path.abspath(sketch_out)}")
     bb_dir = blackbox.finalize(artifact_paths=[eval_mono_imu_png])
     print(f"  [黑盒日志归档] 本次运行历史黑盒日志已保存至: {os.path.abspath(bb_dir)}")
@@ -641,14 +661,13 @@ def run_euroc_monocular_inertial_sequence(mav0_dir: str, max_frames: int = 150, 
 
 
 def _save_evaluation_plot(
-    est_pos: np.ndarray,
-    gt_pos: np.ndarray,
-    map_pts: np.ndarray,
-    fe_times: np.ndarray,
-    be_times: np.ndarray,
-    metrics: dict[str, float],
-    out_path: str
-) -> None:
+    est_pos,
+    gt_pos,
+    map_pts,
+    fe_times,
+    be_times,
+    metrics,
+    out_path) :
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -722,13 +741,13 @@ def _save_evaluation_plot(
 
 
 def _save_mono_vs_stereo_comparison_plot(
-    gt_valid: np.ndarray,
-    stereo_est: np.ndarray,
-    mono_se3_est: np.ndarray,
-    mono_sim3_est: np.ndarray,
-    mono_metrics: dict[str, float],
-    out_path: str,
-) -> None:
+    gt_valid,
+    stereo_est,
+    mono_se3_est,
+    mono_sim3_est,
+    mono_metrics,
+    out_path,
+) :
     """绘制【双目+IMU vs 纯单目(无IMU)】四合一直观对比分析图"""
     try:
         import matplotlib
@@ -801,17 +820,17 @@ def _save_mono_vs_stereo_comparison_plot(
 
 
 def _save_live_hardware_plot(
-    timestamps: np.ndarray,
-    est_pos: np.ndarray,
-    map_pts: np.ndarray,
-    acc_history: np.ndarray,
-    gyro_history: np.ndarray,
-    euler_history: np.ndarray,
-    fe_times: np.ndarray,
-    be_times: np.ndarray,
-    out_path: str,
-    is_monocular: bool = False,
-) -> None:
+    timestamps,
+    est_pos,
+    map_pts,
+    acc_history,
+    gyro_history,
+    euler_history,
+    fe_times,
+    be_times,
+    out_path,
+    is_monocular = False,
+) :
     """绘制实机 USB 双目/单目摄像头 + 串口 IMU 实时采集与 SLAM 跟踪四合一评测报告图"""
     try:
         import matplotlib
@@ -888,17 +907,17 @@ def _save_live_hardware_plot(
 
 
 def run_live_hardware_slam(
-    cam_id: int = -1,
-    concat_width: int = 1280,
-    height: int = 480,
-    imu_port: str = "COM3",
-    imu_baud: int = 9600,
-    calib_json: str = "config/custom_stereo_imu.json",
-    max_frames: int = 0,
-    output_dir: str = "outputs",
-    show_gui: bool = True,
-    force_monocular: bool = False,
-) -> None:
+    cam_id = -1,
+    concat_width = 1280,
+    height = 480,
+    imu_port = "COM3",
+    imu_baud = 9600,
+    calib_json = "config/custom_stereo_imu.json",
+    max_frames = 0,
+    output_dir = "outputs",
+    show_gui = True,
+    force_monocular = False,
+) :
     """
     实机 USB 双目 (1280x480) 或 单目 (640x480) 摄像头 + 串口 IMU 实时 SLAM 跟踪与可视化评测主流程
     (持续运行，仅当用户在窗口按下 'q' 键时退出)
@@ -965,19 +984,19 @@ def run_live_hardware_slam(
     )
     print(f"  [Blackbox] 实时黑盒记录已启动 -> {os.path.abspath(blackbox.run_dir)}")
 
-    vis_records: list[FrameVisRecord] = []
-    ts_list: list[float] = []
-    acc_list: list[np.ndarray] = []
-    gyro_list: list[np.ndarray] = []
-    euler_list: list[np.ndarray] = []
+    vis_records = []
+    ts_list = []
+    acc_list = []
+    gyro_list = []
+    euler_list = []
     sample_pair_saved = False
 
     sketch_3d = Live3DTrajectorySketch(width=1280, height=500)
-    last_sketch_panel: np.ndarray | None = None
-    last_combined_dashboard: np.ndarray | None = None
-    R_imu_ref: np.ndarray | None = None
+    last_sketch_panel = None
+    last_combined_dashboard = None
+    R_imu_ref = None
 
-    def _euler_to_R(eul_deg: np.ndarray) -> np.ndarray:
+    def _euler_to_R(eul_deg) :
         r, p, y = np.deg2rad(eul_deg[0]), np.deg2rad(eul_deg[1]), np.deg2rad(eul_deg[2])
         cr, sr = np.cos(r), np.sin(r)
         cp, sp = np.cos(p), np.sin(p)
@@ -1073,7 +1092,7 @@ def run_live_hardware_slam(
                 for y in range(24, pair_vis.shape[0], 32):
                     cv2.line(pair_vis, (0, y), (pair_vis.shape[1], y), (0, 200, 0), 1, cv2.LINE_AA)
                 sample_path = os.path.join(output_dir, "live_stereo_pair_sample.png")
-                cv2.imwrite(sample_path, pair_vis)
+                _imwrite_safe(sample_path, pair_vis)
                 sample_pair_saved = True
 
             tot_ms_last = max(1.0, float(slam.tracker.timing_stats["total_ms"][-1]))
@@ -1122,9 +1141,9 @@ def run_live_hardware_slam(
                 )
                 if (k + 1) % 60 == 0 or k == 0:
                     if last_sketch_panel is not None:
-                        cv2.imwrite(os.path.join(output_dir, "live_3d_trajectory_sketch.png"), last_sketch_panel)
+                        _imwrite_safe(os.path.join(output_dir, "live_3d_trajectory_sketch.png"), last_sketch_panel)
                     if last_combined_dashboard is not None:
-                        cv2.imwrite(os.path.join(output_dir, "live_slam_dashboard_combined.png"), last_combined_dashboard)
+                        _imwrite_safe(os.path.join(output_dir, "live_slam_dashboard_combined.png"), last_combined_dashboard)
 
             cv2.imshow("Live USB Stereo + IMU SLAM & 3D Trajectory Sketch", last_combined_dashboard)
             key = cv2.waitKey(1) & 0xFF
@@ -1142,10 +1161,10 @@ def run_live_hardware_slam(
     sketch_path = os.path.join(output_dir, "live_3d_trajectory_sketch.png")
     dash_path = os.path.join(output_dir, "live_slam_dashboard_combined.png")
     if last_sketch_panel is not None:
-        cv2.imwrite(sketch_path, last_sketch_panel)
+        _imwrite_safe(sketch_path, last_sketch_panel)
         print(f"  [3D简图已保存] 实时 3D 轨迹简图面板  : {os.path.abspath(sketch_path)}")
     if last_combined_dashboard is not None:
-        cv2.imwrite(dash_path, last_combined_dashboard)
+        _imwrite_safe(dash_path, last_combined_dashboard)
         print(f"  [监控大屏保存] 双目画面+3D轨迹简图大屏: {os.path.abspath(dash_path)}")
 
     if len(vis_records) == 0:
@@ -1229,7 +1248,7 @@ def run_live_hardware_slam(
     )
 
 
-def main() -> None:
+def main() :
     parser = argparse.ArgumentParser(description="Phase 1 Stereo/Stereo-Inertial/Monocular SLAM Validation")
     parser.add_argument("--euroc", type=str, default="", help="Path to EuRoC mav0 directory (optional)")
     parser.add_argument("--mono", action="store_true", help="Run pure Monocular mode (single camera only, no IMU)")

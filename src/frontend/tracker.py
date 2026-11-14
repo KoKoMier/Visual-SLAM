@@ -22,7 +22,7 @@ frontend/tracker.py
      综合考量当前帧跟踪到的参考关键帧地图点比例、近距离双目点数量及帧间隔。
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 from enum import IntEnum
 from typing import TYPE_CHECKING
 import time
@@ -34,6 +34,7 @@ from ..core.frame import Frame
 from ..core.keyframe import KeyFrame
 from ..core.mappoint import MapPoint
 from .orb_extractor import ORBExtractor
+from .hfnet_extractor import HFNetExtractor
 from .stereo_matcher import StereoMatcher
 from .imu_preintegration import ImuPreintegrator, ImuMeasurement
 from ..backend.optimizer import Optimizer
@@ -68,41 +69,50 @@ class Tracker:
 
     def __init__(
         self,
-        camera: StereoCamera,
-        slam_map: Map,
-        local_mapper: LocalMapper,
-        loop_closer: LoopClosing,
-        n_features: int = 600,
-        use_hybrid_optical_flow: bool = True
+        camera,
+        slam_map,
+        local_mapper,
+        loop_closer,
+        n_features = 600,
+        use_hybrid_optical_flow = True,
+        use_hfnet = True,
+        hfnet_root = None,
     ):
         self.camera = camera
         self.slam_map = slam_map
         self.local_mapper = LocalMapper(self.slam_map) if local_mapper is None else local_mapper
         self.loop_closer = loop_closer
 
-        self.orb_extractor = ORBExtractor(n_features=n_features)
+        if use_hfnet:
+            try:
+                self.orb_extractor = HFNetExtractor(n_features=n_features, hfnet_root=hfnet_root)
+            except Exception as exc:
+                print(f"  [Tracker] HF-Net 初始化回退至 ORBExtractor: {exc}")
+                self.orb_extractor = ORBExtractor(n_features=n_features)
+        else:
+            self.orb_extractor = ORBExtractor(n_features=n_features)
         self.imu_preintegrator = ImuPreintegrator()
 
-        self.state: TrackingState = TrackingState.NO_IMAGES_YET
-        self.curr_frame: Frame | None = None
-        self.last_frame: Frame | None = None
-        self.prev_frame: Frame | None = None
-        self.mono_init_frame: Frame | None = None
-        self.ref_kf: KeyFrame | None = None
-        self.last_kf_frame_id: int = 0
+        self.state = TrackingState.NO_IMAGES_YET
+        self.curr_frame = None
+        self.last_frame = None
+        self.prev_frame = None
+        self.mono_init_frame = None
+        self.ref_kf = None
+        self.last_kf_frame_id = 0
 
-        self.local_keyframes: list[KeyFrame] = []
-        self.local_mappoints: list[MapPoint] = []
+        self.local_keyframes = []
+        self.local_mappoints = []
 
-        self.velocity: SE3 = SE3.identity()
-        self.has_velocity: bool = False
-        self.use_hybrid_optical_flow: bool = bool(use_hybrid_optical_flow)
-        self.last_is_keyframe: bool = False
-        self.last_used_optical_flow: bool = False
-        self.last_inliers: int = 0
-        self.last_flow_prior_T_cr: SE3 | None = None
-        self._gyro_vec_hist: list[np.ndarray] = []
-        self.last_diag: dict[str, float] = {
+        self.velocity = SE3.identity()
+        self.has_velocity = False
+        self.use_hybrid_optical_flow = bool(use_hybrid_optical_flow)
+        self.last_is_keyframe = False
+        self.last_used_optical_flow = False
+        self.last_inliers = 0
+        self.last_flow_prior_T_cr = None
+        self._gyro_vec_hist = []
+        self.last_diag = {
             "trans_gate": 1.0,
             "eff_gyro_deg_s": 0.0,
             "raw_flow_px": 0.0,
@@ -110,7 +120,7 @@ class Tracker:
             "radial_med_px": 0.0,
         }
 
-        self.timing_stats: dict[str, list[float]] = {
+        self.timing_stats = {
             "frontend_ms": [],
             "backend_ms": [],
             "total_ms": []
@@ -118,11 +128,11 @@ class Tracker:
 
     def grab_image_stereo(
         self,
-        img_left: np.ndarray,
-        img_right: np.ndarray,
-        timestamp: float,
-        imu_measurements: list[ImuMeasurement] | None = None
-    ) -> SE3:
+        img_left,
+        img_right,
+        timestamp,
+        imu_measurements = None
+    ) :
         """
         主入口: 输入双目图像与可选的帧间 IMU 测量序列，返回当前帧估计位姿 T_cw (SE3)
         """
@@ -170,12 +180,12 @@ class Tracker:
         has_imu_prior = bool(imu_measurements is not None and len(imu_measurements) > 0 and self.imu_preintegrator.dt_total > 0.0)
         R_cw_imu_prior = T_cw_pred_init.R.copy() if has_imu_prior else None
         if has_imu_prior:
-            w_rot_imu = 2.0e6 if len(imu_measurements) >= 5 else 50.0
+            w_rot_imu = 2.0e6 if (len(imu_measurements) >= 2 or self.camera.width == 640) else 50.0
         else:
             w_rot_imu = 0.0
-        T_cw_flow_prior: SE3 | None = None
-        flow_pts_cached: np.ndarray | None = None
-        flow_mps_cached: list[MapPoint | None] | None = None
+        T_cw_flow_prior = None
+        flow_pts_cached = None
+        flow_mps_cached = None
 
         if self.use_hybrid_optical_flow and self.last_frame is not None:
             kp_pts, u_right, depths, tracked_mps = StereoMatcher.track_optical_flow(
@@ -321,11 +331,11 @@ class Tracker:
 
     def _stereo_initialization(
         self,
-        rect_l: np.ndarray,
-        rect_r: np.ndarray,
-        timestamp: float,
-        imu_measurements: list[ImuMeasurement] | None = None,
-    ) -> None:
+        rect_l,
+        rect_r,
+        timestamp,
+        imu_measurements = None,
+    ) :
         """
         双目系统初始化 (对应 Tracking::StereoInitialization):
         第一帧位于世界坐标系原点 T_cw = Identity，将所有有效双目深度点直接反投影为初始 3D 地图点。
@@ -389,10 +399,10 @@ class Tracker:
 
     def grab_image_monocular(
         self,
-        img_left: np.ndarray,
-        timestamp: float,
-        imu_measurements: list[ImuMeasurement] | None = None,
-    ) -> SE3:
+        img_left,
+        timestamp,
+        imu_measurements = None,
+    ) :
         """
         单目 / 单目+IMU 紧耦合跟踪主入口 (对应 ORB-SLAM3 Tracking::GrabImageMonocular):
         支持纯单目 (imu_measurements=None) 与单目+IMU 紧耦合 (imu_measurements!=None) 两种模式。
@@ -447,9 +457,9 @@ class Tracker:
         else:
             w_rot_imu = 0.0
         trans_gate = 1.0
-        T_cw_flow_prior: SE3 | None = None
-        flow_pts_cached: np.ndarray | None = None
-        flow_mps_cached: list[MapPoint | None] | None = None
+        T_cw_flow_prior = None
+        flow_pts_cached = None
+        flow_mps_cached = None
 
         if self.use_hybrid_optical_flow and self.last_frame is not None:
             kp_pts, u_right, depths, tracked_mps = StereoMatcher.track_optical_flow(
@@ -512,7 +522,11 @@ class Tracker:
                     flow_mps_cached = list(self.curr_frame.map_points)
 
                 th_retrack = 22 if self.camera.width == 640 else 38
-                if self.camera.width == 640 and n_inliers >= 45 and not self._need_new_keyframe(n_inliers, is_flow_only=True):
+                frames_since_kf = self.curr_frame.id - self.last_kf_frame_id
+                if self.camera.width == 640 and frames_since_kf <= 3 and n_inliers >= 18:
+                    # 关键帧刚创建后的 3 帧内禁止连续重跑 HF-Net 全图特征提取，直接走光流+增量补点，消除连续慢帧雪崩
+                    need_kf_or_retrack = False
+                elif self.camera.width == 640 and n_inliers >= 45 and not self._need_new_keyframe(n_inliers, is_flow_only=True):
                     need_kf_or_retrack = False
                 elif self._need_new_keyframe(n_inliers, is_flow_only=True) or n_inliers < th_retrack:
                     need_kf_or_retrack = True
@@ -682,9 +696,19 @@ class Tracker:
         if self.camera.width == 640 and self.last_frame is not None:
             curr_mp_ids = {mp.id for mp in self.curr_frame.map_points if mp is not None}
             for mp_old in self.last_frame.map_points:
-                if mp_old is not None and not mp_old.is_bad and mp_old.num_observations() == 0:
-                    if mp_old.id not in curr_mp_ids:
+                if mp_old is not None and not mp_old.is_bad and mp_old.id not in curr_mp_ids:
+                    n_obs = mp_old.num_observations()
+                    is_temp = getattr(mp_old, "is_temp_flow_point", False)
+                    if n_obs == 0 or (is_temp and n_obs <= 1):
                         mp_old.set_bad_flag(self.slam_map)
+            # 防止长时间运行临时流点累积膨胀: 当活跃地图点超过 1100 个时，自动回收最旧的未在当前帧中的单次观测临时点
+            if self.slam_map.num_mappoints() > 1100:
+                all_mps = sorted(self.slam_map.get_all_mappoints(), key=lambda m: m.id)
+                for mp_cand in all_mps:
+                    if self.slam_map.num_mappoints() <= 950:
+                        break
+                    if mp_cand.id not in curr_mp_ids and getattr(mp_cand, "is_temp_flow_point", False) and mp_cand.num_observations() <= 1:
+                        mp_cand.set_bad_flag(self.slam_map)
 
         self.prev_frame = self.last_frame
         self.last_is_keyframe = created_kf
@@ -698,10 +722,10 @@ class Tracker:
 
     def _monocular_initialization(
         self,
-        rect_l: np.ndarray,
-        timestamp: float,
-        imu_measurements: list[ImuMeasurement] | None = None,
-    ) -> None:
+        rect_l,
+        timestamp,
+        imu_measurements = None,
+    ) :
         """
         单目 / 单目+IMU 双视图初始化 (对应 ORB-SLAM3 Tracking::MonocularInitialization):
         1. 第 0 帧提取四叉树 ORB 特征作为参考帧 F0；
@@ -763,9 +787,9 @@ class Tracker:
         p1_2d = pts1_out.reshape(-1, 2)
         fb_err = np.linalg.norm(p0_2d - pts0_back.reshape(-1, 2), axis=1)
 
-        matched_idx0: list[int] = []
-        matched_pts0: list[np.ndarray] = []
-        matched_pts1: list[np.ndarray] = []
+        matched_idx0 = []
+        matched_pts0 = []
+        matched_pts1 = []
         for idx0 in range(len(p0_2d)):
             if st_fwd[idx0, 0] == 1 and st_bwd[idx0, 0] == 1 and fb_err[idx0] <= 1.5:
                 u1, v1 = float(p1_2d[idx0, 0]), float(p1_2d[idx0, 1])
@@ -841,7 +865,7 @@ class Tracker:
             pts3d = (pts4d[:3] / (pts4d[3:] + 1e-12)).T
 
             valid_tri = []
-            depths_0: list[float] = []
+            depths_0 = []
             for k_m, idx0 in enumerate(matched_idx0):
                 if mask_pose[k_m, 0] == 0:
                     continue
@@ -939,7 +963,7 @@ class Tracker:
         self.has_velocity = True
         self.state = TrackingState.OK
 
-    def _update_last_frame_replaced_mappoints(self) -> None:
+    def _update_last_frame_replaced_mappoints(self) :
         """
         对应 ORB-SLAM3 Tracking::UpdateLastFrame() 中的地图点替换链解析:
         当局部建图 SearchInNeighbors 或回环融合将上一帧的 MapPoint 合并替换 (mp.replace(other)) 后，
@@ -954,7 +978,7 @@ class Tracker:
                 if rep is not None:
                     self.last_frame.map_points[idx] = rep
 
-    def _compute_predicted_pose(self, imu_measurements: list[ImuMeasurement] | None) -> SE3:
+    def _compute_predicted_pose(self, imu_measurements) :
         """
         结合 200Hz IMU 陀螺仪旋转预积分 (经左相机-Body外参 R_b_c 共轭变换) 与恒速线速度模型预测当前帧初始位姿 T_cw
         """
@@ -1024,11 +1048,11 @@ class Tracker:
 
     def _estimate_rotation_and_trans_gate(
         self,
-        kp_pts: np.ndarray,
-        tracked_mps: list[MapPoint | None],
-        imu_measurements: list[ImuMeasurement] | None,
-        R_cw_imu_prior: np.ndarray | None,
-    ) -> tuple[np.ndarray | None, float]:
+        kp_pts,
+        tracked_mps,
+        imu_measurements,
+        R_cw_imu_prior,
+    ) :
         """
         实机单目+IMU模式 (640x480) 旋转-平移解耦与纯旋转门控:
         1. 严禁使用视觉纯旋转 dR_vis 覆盖 R_cw_imu_prior（否则单目横向平移光流会被吸收为伪偏航/俯仰角，导致平移归零）；
@@ -1050,7 +1074,7 @@ class Tracker:
         curr_gyro_deg_s = float(np.rad2deg(np.linalg.norm(curr_gyro_vec)))
         eff_gyro_deg_s = max(avg_gyro_deg_s, 0.70 * curr_gyro_deg_s)
 
-        last_mp_to_pt: dict[int, np.ndarray] = {}
+        last_mp_to_pt = {}
         for i_l, mp_l in enumerate(self.last_frame.map_points):
             if mp_l is not None and not mp_l.is_bad and not self.last_frame.outliers[i_l]:
                 last_mp_to_pt[mp_l.id] = self.last_frame.kp_pts[i_l]
@@ -1163,7 +1187,7 @@ class Tracker:
 
         return R_cw_imu_prior, trans_gate
 
-    def _replenish_live_flow_features(self, rect_l: np.ndarray, n_inliers: int) -> int:
+    def _replenish_live_flow_features(self, rect_l, n_inliers) :
         """
         实机单目+IMU模式 (640x480) 8x6 网格均匀化特征与地图点增量补充 (~1.0 ms):
         当普通光流帧跟踪点少于 210 个时，在全图 8x6 空间网格的稀疏区域内补充高响应 FAST 角点，
@@ -1178,9 +1202,9 @@ class Tracker:
         cell_counts = np.zeros((n_rows, n_cols), dtype=np.int32)
         occ_grid = np.zeros((h // 12 + 2, w // 12 + 2), dtype=bool)
 
-        surviving_pts: list[np.ndarray] = []
-        surviving_mps: list[MapPoint] = []
-        valid_zs: list[float] = []
+        surviving_pts = []
+        surviving_mps = []
+        valid_zs = []
         T_cw = self.curr_frame.T_cw
         for idx, mp in enumerate(self.curr_frame.map_points):
             if mp is not None and not mp.is_bad and not self.curr_frame.outliers[idx]:
@@ -1207,9 +1231,17 @@ class Tracker:
         if not raw_kps:
             return len(surviving_pts)
 
-        # 按响应值从高到低排序，并在 8x6 网格内均匀选取 (每格最多 5 个点，且间距 >= 12px)
-        raw_kps_sorted = sorted(raw_kps, key=lambda k: k.response, reverse=True)
-        added_pts: list[tuple[float, float]] = []
+        # 结合最近一次 HF-Net 稠密显著性响应图 (last_scores_map) 与角点响应值排序，在 8x6 网格内均匀选取 (每格最多 5 个点，且间距 >= 12px)
+        scores_map_ref = getattr(self.orb_extractor, "last_scores_map", None)
+        if scores_map_ref is not None and scores_map_ref.shape[0] == h and scores_map_ref.shape[1] == w:
+            raw_kps_sorted = sorted(
+                raw_kps,
+                key=lambda k: float(k.response) * (1.0 + 120.0 * float(scores_map_ref[int(k.pt[1]) + border, int(k.pt[0]) + border])),
+                reverse=True,
+            )
+        else:
+            raw_kps_sorted = sorted(raw_kps, key=lambda k: k.response, reverse=True)
+        added_pts = []
         max_per_cell = 5
         for kp in raw_kps_sorted:
             u_abs = float(kp.pt[0]) + border
@@ -1247,6 +1279,7 @@ class Tracker:
             pos_w = R_wc @ p_c + t_wc
             desc = descs[idx_c] if (descs is not None and idx_c < len(descs)) else None
             mp = MapPoint(pos_w, ref_kf=self.ref_kf, first_frame_id=self.curr_frame.id, descriptor=desc)
+            mp.is_temp_flow_point = True
             mp.increase_visible()
             mp.increase_found()
             self.slam_map.add_mappoint(mp)
@@ -1273,24 +1306,23 @@ class Tracker:
 
     def _merge_flow_and_orb_features(
         self,
-        rect_l: np.ndarray,
-        rect_r: np.ndarray | None,
-        flow_pts: np.ndarray,
-        flow_mps: list[MapPoint | None],
-        kp_pts: np.ndarray,
-        kp_octaves: np.ndarray,
-        kp_angles: np.ndarray,
-        descriptors: np.ndarray | None,
-        u_right: np.ndarray,
-        depths: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, np.ndarray, list[MapPoint | None]]:
+        rect_l,
+        rect_r,
+        flow_pts,
+        flow_mps,
+        kp_pts,
+        kp_octaves,
+        kp_angles,
+        descriptors,
+        u_right,
+        depths) :
         """
         将亚像素光流跟踪内点与新提取的四叉树 ORB 特征点无损融合:
         - 若某 ORB 特征点与光流点距离 < 1.5 px，直接绑定该 MapPoint 并将坐标更新为亚像素光流坐标；
         - 其余未重合的光流内点直接保留其精确亚像素坐标与原代表描述子加入特征列表，完全消除吸附误差！
         """
         n_orb = len(kp_pts)
-        init_mps: list[MapPoint | None] = [None] * n_orb
+        init_mps = [None] * n_orb
         if len(flow_pts) == 0 or descriptors is None:
             return kp_pts, kp_octaves, kp_angles, descriptors, u_right, depths, init_mps
 
@@ -1298,7 +1330,7 @@ class Tracker:
         extra_octs = []
         extra_angs = []
         extra_descs = []
-        extra_mps: list[MapPoint | None] = []
+        extra_mps = []
 
         for pt, mp in zip(flow_pts, flow_mps):
             if mp is None or mp.is_bad or mp.descriptor is None:
@@ -1336,13 +1368,13 @@ class Tracker:
 
         return kp_pts, kp_octaves, kp_angles, descriptors, u_right, depths, init_mps
 
-    def _match_from_last_frame(self) -> None:
+    def _match_from_last_frame(self) :
         """对上一帧剩余有效地图点执行重投影 + ORB 描述子匹配 (对应 TrackWithMotionModel)"""
         assert self.curr_frame is not None
         if self.last_frame is not None and self.curr_frame.descriptors is not None:
             T_cw = self.curr_frame.T_cw
             already_matched = {mp for mp in self.curr_frame.map_points if mp is not None}
-            proj_candidates: list[MapPoint] = []
+            proj_candidates = []
             for mp in self.last_frame.map_points:
                 if mp is None or mp.is_bad or mp in already_matched:
                     continue
@@ -1363,9 +1395,9 @@ class Tracker:
 
     def _track_local_map(
         self,
-        R_cw_prior: np.ndarray | None = None,
-        rot_prior_weight: float = 0.0
-    ) -> int:
+        R_cw_prior = None,
+        rot_prior_weight = 0.0
+    ) :
         """
         局部地图跟踪 (对应 ORB-SLAM3 Tracking::TrackLocalMap):
         1. 更新局部关键帧与局部地图点集合 (UpdateLocalMap)
@@ -1397,12 +1429,12 @@ class Tracker:
 
         return max(n_inliers, final_good)
 
-    def _update_local_map(self) -> None:
+    def _update_local_map(self) :
         """
         通过共视图收集局部关键帧 (UpdateLocalKeyFrames) 与局部地图点 (UpdateLocalPoints)
         """
         assert self.curr_frame is not None
-        kf_counter: dict[KeyFrame, int] = {}
+        kf_counter = {}
         for mp in self.curr_frame.map_points:
             if mp is not None and not mp.is_bad:
                 for kf in mp.observations.keys():
@@ -1412,9 +1444,9 @@ class Tracker:
         if len(kf_counter) == 0 and self.ref_kf is not None:
             kf_counter[self.ref_kf] = 1
 
-        local_kfs_set: set[KeyFrame] = set()
+        local_kfs_set = set()
         max_votes = 0
-        best_ref_kf: KeyFrame | None = self.ref_kf
+        best_ref_kf = self.ref_kf
 
         for kf, votes in kf_counter.items():
             local_kfs_set.add(kf)
@@ -1439,7 +1471,7 @@ class Tracker:
         self.local_keyframes = sorted(local_kfs_set, key=lambda k: k.id, reverse=True)
 
         # 收集局部关键帧关联的所有有效地图点 (优先投影最新关键帧的近处地图点)
-        local_mps_set: set[MapPoint] = set()
+        local_mps_set = set()
         for kf in self.local_keyframes:
             for mp in kf.map_points:
                 if mp is not None and not mp.is_bad:
@@ -1448,7 +1480,7 @@ class Tracker:
         self.local_mappoints = sorted(local_mps_set, key=lambda m: m.id, reverse=True)
         self.slam_map.set_reference_mappoints(self.local_mappoints)
 
-    def _search_local_points(self) -> None:
+    def _search_local_points(self) :
         """
         视野锥体筛查 (Frustum Culling) + 局部地图点投影匹配
         对应 ORB-SLAM3 Tracking::SearchLocalPoints()
@@ -1462,7 +1494,7 @@ class Tracker:
 
         T_cw = self.curr_frame.T_cw
         o_w = self.curr_frame.get_camera_center()
-        to_project: list[MapPoint] = []
+        to_project = []
 
         for mp in self.local_mappoints:
             if mp.last_frame_seen == frame_id or mp.is_bad:
@@ -1501,7 +1533,7 @@ class Tracker:
         if len(to_project) > 0:
             StereoMatcher.search_by_projection(self.curr_frame, to_project, th_radius=6.0)
 
-    def _need_new_keyframe(self, n_tracked_inliers: int, is_flow_only: bool = False) -> bool:
+    def _need_new_keyframe(self, n_tracked_inliers, is_flow_only = False) :
         """
         关键帧插入准则 (对应 ORB-SLAM3 Tracking::NeedNewKeyFrame):
         1. 跟踪到的近距离双目点跌破阈值且当前帧拥有充足的可新建近距离双目点；
@@ -1514,17 +1546,24 @@ class Tracker:
 
         if is_mono:
             if self.camera.width == 640:
-                # 实机单目+IMU模式: 普通帧已在 Path A 内增量补点，仅在视角显著变化或内点跌破阈值时创建关键帧
-                if frames_since_last_kf < 4:
+                # 实机单目+IMU模式: 普通帧已在 Path A 内增量补点，仅在具有真实平移基线或内点跌破阈值时创建关键帧
+                # 纯旋转门控期间 (trans_gate < 0.25) 零基线无法三角化新深度，抑制无意义的纯旋转关键帧阻塞
+                if frames_since_last_kf < 5:
                     return False
                 min_inliers_live = 22 if is_flow_only else 35
                 if n_tracked_inliers < min_inliers_live:
                     return True
                 if self.ref_kf is not None and frames_since_last_kf >= 18:
+                    diag = getattr(self, "last_diag", {}) or {}
+                    trans_gate = float(diag.get("trans_gate", 1.0))
                     dp_ref = float(np.linalg.norm(self.curr_frame.get_camera_center() - self.ref_kf.get_camera_center()))
                     dR_ref = self.curr_frame.T_cw.R @ self.ref_kf.T_cw.R.T
                     rot_deg = float(np.rad2deg(np.arccos(np.clip((np.trace(dR_ref) - 1.0) * 0.5, -1.0, 1.0))))
-                    if dp_ref >= 0.045 or rot_deg >= 8.0:
+                    if dp_ref >= 0.045:
+                        return True
+                    if trans_gate >= 0.35 and dp_ref >= 0.020 and rot_deg >= 10.0:
+                        return True
+                    if rot_deg >= 28.0 and frames_since_last_kf >= 35 and n_tracked_inliers < 85:
                         return True
                 return False
 
@@ -1560,7 +1599,7 @@ class Tracker:
 
         return need_for_close or cond_ratio or cond_max_gap
 
-    def _create_new_keyframe(self) -> None:
+    def _create_new_keyframe(self) :
         """
         创建新关键帧，触发 LocalMapper 与 LoopClosing，并将 Local BA 优化后的位姿与地图点同步回当前帧
         对应 ORB-SLAM3 Tracking::CreateNewKeyFrame()

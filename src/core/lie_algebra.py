@@ -11,11 +11,11 @@ core/lie_algebra.py
 - 位姿左乘扰动更新模型: T_new = SE3.exp(d_xi) * T_old
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 import numpy as np
 
 
-def skew(v: np.ndarray) -> np.ndarray:
+def skew(v) :
     """
     向量反对称矩阵算子 [v]_x (对应 C++ Sophus::SO3d::hat)
     输入: v (3,)
@@ -29,14 +29,14 @@ def skew(v: np.ndarray) -> np.ndarray:
     ], dtype=np.float64)
 
 
-def vee(M: np.ndarray) -> np.ndarray:
+def vee(M) :
     """
     反对称矩阵转向量算子 (对应 C++ Sophus::SO3d::vee)
     """
     return np.array([M[2, 1] - M[1, 2], M[0, 2] - M[2, 0], M[1, 0] - M[0, 1]], dtype=np.float64) * 0.5
 
 
-def exp_so3(omega: np.ndarray) -> np.ndarray:
+def exp_so3(omega) :
     """
     SO(3) 指数映射: exp([omega]_x) -> R in SO(3) (罗德里格斯公式)
     对应 C++ Sophus::SO3d::exp(omega)
@@ -54,7 +54,7 @@ def exp_so3(omega: np.ndarray) -> np.ndarray:
         return np.eye(3, dtype=np.float64) + A * W + B * (W @ W)
 
 
-def log_so3(R: np.ndarray) -> np.ndarray:
+def log_so3(R) :
     """
     SO(3) 对数映射: log(R) -> omega in R^3
     对应 C++ Sophus::SO3d::log()
@@ -78,7 +78,7 @@ def log_so3(R: np.ndarray) -> np.ndarray:
         return (theta / np.sin(theta)) * vee(R)
 
 
-def right_jacobian_so3(omega: np.ndarray) -> np.ndarray:
+def right_jacobian_so3(omega) :
     """
     SO(3) 右雅可比矩阵 J_r(omega)
     满足: exp(omega + d_omega) approx exp(omega) * exp(J_r(omega) * d_omega)
@@ -97,7 +97,7 @@ def right_jacobian_so3(omega: np.ndarray) -> np.ndarray:
         return I3 - c1 * W + c2 * (W @ W)
 
 
-def right_jacobian_inv_so3(omega: np.ndarray) -> np.ndarray:
+def right_jacobian_inv_so3(omega) :
     """
     SO(3) 右雅可比逆矩阵 J_r^{-1}(omega)
     """
@@ -123,7 +123,7 @@ class SE3:
     """
     __slots__ = ("R", "t")
 
-    def __init__(self, R: np.ndarray | None = None, t: np.ndarray | None = None):
+    def __init__(self, R = None, t = None):
         if R is None:
             self.R = np.eye(3, dtype=np.float64)
         else:
@@ -134,35 +134,35 @@ class SE3:
             self.t = np.asarray(t, dtype=np.float64).reshape(3).copy()
 
     @classmethod
-    def identity(cls) -> SE3:
+    def identity(cls) :
         return cls()
 
     @classmethod
-    def from_matrix(cls, T: np.ndarray) -> SE3:
+    def from_matrix(cls, T) :
         T = np.asarray(T, dtype=np.float64).reshape(4, 4)
         return cls(T[:3, :3], T[:3, 3])
 
-    def matrix(self) -> np.ndarray:
+    def matrix(self) :
         """返回 4x4 齐次变换矩阵"""
         T = np.eye(4, dtype=np.float64)
         T[:3, :3] = self.R
         T[:3, 3] = self.t
         return T
 
-    def inverse(self) -> SE3:
+    def inverse(self) :
         """位姿求逆: T^{-1} = [R^T, -R^T * t]"""
         R_inv = self.R.T
         t_inv = -(R_inv @ self.t)
         return SE3(R_inv, t_inv)
 
-    def copy(self) -> SE3:
+    def copy(self) :
         return SE3(self.R.copy(), self.t.copy())
 
-    def __mul__(self, other: SE3) -> SE3:
+    def __mul__(self, other) :
         """群乘法: T1 * T2"""
         return SE3(self.R @ other.R, self.R @ other.t + self.t)
 
-    def transform(self, pts: np.ndarray) -> np.ndarray:
+    def transform(self, pts) :
         """
         对 3D 点或点集进行坐标变换: P_out = R * P_in + t
         支持输入 (3,) 或 (N, 3)
@@ -174,7 +174,7 @@ class SE3:
             return (pts @ self.R.T) + self.t
 
     @classmethod
-    def exp(cls, xi: np.ndarray) -> SE3:
+    def exp(cls, xi) :
         """
         SE(3) 指数映射: xi = [omega (3), rho (3)]^T -> SE3
         对应 g2o::SE3Quat::exp(xi)
@@ -201,7 +201,7 @@ class SE3:
         t = V @ rho
         return cls(R, t)
 
-    def log(self) -> np.ndarray:
+    def log(self) :
         """
         SE(3) 对数映射: SE3 -> xi = [omega (3), rho (3)]^T in R^6
         """
@@ -221,7 +221,7 @@ class SE3:
         rho = V_inv @ self.t
         return np.concatenate([omega, rho])
 
-    def normalize(self) -> None:
+    def normalize(self) :
         """利用 SVD 保持旋转矩阵正交性 (消除多次迭代累积舍入误差)"""
         U, _, Vt = np.linalg.svd(self.R)
         self.R = U @ Vt
@@ -229,6 +229,6 @@ class SE3:
             U[:, -1] *= -1.0
             self.R = U @ Vt
 
-    def __repr__(self) -> str:
+    def __repr__(self) :
         omega = log_so3(self.R)
         return f"SE3(rot_vec={np.round(omega, 4)}, t={np.round(self.t, 4)})"

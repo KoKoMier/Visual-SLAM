@@ -17,7 +17,7 @@ backend/optimizer.py
    先边缘化所有 3D 地图点，仅对滑动窗口内的关键帧位姿求逆，计算复杂度从 O((6K+3M)^3) 骤降至 O((6K)^3 + M)！
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 from typing import TYPE_CHECKING
 import numpy as np
 
@@ -32,19 +32,19 @@ if TYPE_CHECKING:
 
 class Optimizer:
     # 95% 置信度卡方分布阈值与 Huber 核阈值 (对应 ORB-SLAM3 Optimizer.cc)
-    CHI2_MONO: float = 5.991
-    CHI2_STEREO: float = 7.815
-    HUBER_MONO: float = np.sqrt(5.991)
-    HUBER_STEREO: float = np.sqrt(7.815)
+    CHI2_MONO = 5.991
+    CHI2_STEREO = 7.815
+    HUBER_MONO = np.sqrt(5.991)
+    HUBER_STEREO = np.sqrt(7.815)
 
     @classmethod
     def pose_optimization(
         cls,
-        frame: Frame,
-        n_its_per_round: int = 8,
-        R_cw_prior: np.ndarray | None = None,
-        rot_prior_weight: float = 0.0
-    ) -> int:
+        frame,
+        n_its_per_round = 8,
+        R_cw_prior = None,
+        rot_prior_weight = 0.0
+    ) :
         """
         仅优化当前帧 6DoF 位姿 (Motion-only BA / Visual-Inertial Pose Optimization)
         对应 ORB-SLAM3 Optimizer::PoseOptimization / PoseInertialOptimizationLastFrame
@@ -54,11 +54,11 @@ class Optimizer:
         返回最终内点数量 (n_inliers)。
         """
         # 收集当前帧所有关联到有效 MapPoint 的观测
-        obs_indices: list[int] = []
-        pts_w_list: list[np.ndarray] = []
-        uv_obs_list: list[tuple[float, float, float]] = []
-        is_stereo_list: list[bool] = []
-        inv_sigma2_list: list[float] = []
+        obs_indices = []
+        pts_w_list = []
+        uv_obs_list = []
+        is_stereo_list = []
+        inv_sigma2_list = []
 
         for idx, mp in enumerate(frame.map_points):
             if mp is not None and not mp.is_bad:
@@ -223,11 +223,11 @@ class Optimizer:
     @classmethod
     def local_bundle_adjustment(
         cls,
-        kf: KeyFrame,
-        slam_map: Map,
-        max_local_kfs: int = 8,
-        n_iterations: int = 6
-    ) -> None:
+        kf,
+        slam_map,
+        max_local_kfs = 8,
+        n_iterations = 6
+    ) :
         """
         固定滑动窗口局部捆集调整 (Local BA with Sparse Schur Complement)
         对应 ORB-SLAM3 Optimizer::LocalBundleAdjustment(KeyFrame *pKF, ...)
@@ -243,14 +243,14 @@ class Optimizer:
         4. 回代求解地图点更新量 d_P_m 并剔除卡方检验超标的外点观测。
         """
         # 1. 收集局部活跃关键帧 (当前关键帧 + 共视程度最高的前 max_local_kfs-1 个邻居)
-        local_kfs: list[KeyFrame] = [kf]
+        local_kfs = [kf]
         cov_kfs = kf.get_best_covisibility_keyframes(max_local_kfs - 1)
         for c_kf in cov_kfs:
             if not c_kf.is_bad:
                 local_kfs.append(c_kf)
 
         # 2. 收集局部关键帧观测到的所有有效 MapPoint
-        local_mps_set: set[MapPoint] = set()
+        local_mps_set = set()
         for l_kf in local_kfs:
             for mp in l_kf.map_points:
                 if mp is not None and not mp.is_bad and mp.num_observations() >= 2:
@@ -261,7 +261,7 @@ class Optimizer:
 
         # 3. 收集观测到局部地图点但不属于 local_kfs 的固定锚点关键帧 (Fixed KeyFrames)
         local_kf_set = set(local_kfs)
-        fixed_kfs_set: set[KeyFrame] = set()
+        fixed_kfs_set = set()
         for mp in local_mps:
             for obs_kf in mp.observations.keys():
                 if not obs_kf.is_bad and obs_kf not in local_kf_set:
@@ -272,8 +272,8 @@ class Optimizer:
         # 第 0 号世界原点关键帧永远固定；单目+IMU模式下同时固定第 1 号初始化关键帧以锁定初始物理基线尺度；其余作为可优化变量
         is_mono_window = all(np.all(k.depths < 0.0) for k in local_kfs)
         has_imu_in_window = any(k.R_cw_imu_prior is not None for k in local_kfs)
-        opt_kfs: list[KeyFrame] = []
-        fixed_kfs: list[KeyFrame] = sorted(fixed_kfs_set, key=lambda k: k.id)
+        opt_kfs = []
+        fixed_kfs = sorted(fixed_kfs_set, key=lambda k: k.id)
         for l_kf in local_kfs:
             if l_kf.id == 0 or (is_mono_window and has_imu_in_window and l_kf.id == 1):
                 fixed_kfs.append(l_kf)
@@ -289,13 +289,13 @@ class Optimizer:
         mp_to_idx = {mp: i for i, mp in enumerate(local_mps)}
 
         # 4. 构建所有观测边列表
-        edges_kf_all_idx: list[int] = []
-        edges_kf_opt_idx: list[int] = []  # 若为固定关键帧则为 -1
-        edges_mp_idx: list[int] = []
-        edges_feat_idx: list[int] = []
-        edges_uv_obs: list[tuple[float, float, float]] = []
-        edges_is_stereo: list[bool] = []
-        edges_inv_sigma2: list[float] = []
+        edges_kf_all_idx = []
+        edges_kf_opt_idx = []  # 若为固定关键帧则为 -1
+        edges_mp_idx = []
+        edges_feat_idx = []
+        edges_uv_obs = []
+        edges_is_stereo = []
+        edges_inv_sigma2 = []
 
         for mp_i, mp in enumerate(local_mps):
             for obs_kf, feat_idx in mp.observations.items():
@@ -590,12 +590,12 @@ class Optimizer:
     @classmethod
     def optimize_essential_graph(
         cls,
-        slam_map: Map,
-        loop_kf: KeyFrame,
-        curr_kf: KeyFrame,
-        T_loop_corr_cw: SE3,
-        n_iterations: int = 20
-    ) -> None:
+        slam_map,
+        loop_kf,
+        curr_kf,
+        T_loop_corr_cw,
+        n_iterations = 20
+    ) :
         """
         本质图 6DoF 位姿图优化 (Pose Graph Optimization on Essential Graph)
         对应 ORB-SLAM3 Optimizer::OptimizeEssentialGraph
@@ -613,8 +613,8 @@ class Optimizer:
         old_T_wc = [k.get_pose_inverse() for k in all_kfs]
 
         # 构建本质图相对位姿约束边 (i, j, T_ij_meas, weight)
-        edges: list[tuple[int, int, SE3, float]] = []
-        visited_pairs: set[tuple[int, int]] = set()
+        edges = []
+        visited_pairs = set()
 
         for k_i in all_kfs:
             i = kf_to_idx[k_i]

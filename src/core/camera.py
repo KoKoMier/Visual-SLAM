@@ -13,7 +13,7 @@ core/camera.py
   u_r = u - bf / Z   (其中 bf = baseline * fx, 视差 d = u - u_r = bf / Z)
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 import numpy as np
 import cv2
 
@@ -34,16 +34,16 @@ class StereoCamera:
 
     def __init__(
         self,
-        fx: float,
-        fy: float,
-        cx: float,
-        cy: float,
-        baseline: float,
-        width: int = 752,
-        height: int = 480,
-        th_depth_factor: float = 40.0,
-        fps: float = 20.0,
-        T_b_c1: np.ndarray | None = None
+        fx,
+        fy,
+        cx,
+        cy,
+        baseline,
+        width = 752,
+        height = 480,
+        th_depth_factor = 40.0,
+        fps = 20.0,
+        T_b_c1 = None
     ):
         self.fx = float(fx)
         self.fy = float(fy)
@@ -79,10 +79,9 @@ class StereoCamera:
 
     def init_stereo_rectification(
         self,
-        K_l: np.ndarray, D_l: np.ndarray,
-        K_r: np.ndarray, D_r: np.ndarray,
-        R_r_l: np.ndarray, t_r_l: np.ndarray
-    ) -> None:
+        K_l, D_l,
+        K_r, D_r,
+        R_r_l, t_r_l) :
         """
         根据左右原始内参、畸变系数与左右外参 T_r_l 初始化双目立体极线校正映射表 (cv2.stereoRectify)
         校正后更新当前相机的有效内参 fx, fy, cx, cy, baseline, bf
@@ -119,7 +118,7 @@ class StereoCamera:
         # 同步修正左相机到 Body 外参旋转: R_b_c1_rect = R_b_c1_raw * R1^T
         self.T_b_c1[:3, :3] = self.T_b_c1[:3, :3] @ R1.T
 
-    def rectify_stereo(self, img_l: np.ndarray, img_r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def rectify_stereo(self, img_l, img_r) :
         """对原始双目图像进行去畸变与极线对齐"""
         if self._map1_l is None:
             return img_l, img_r
@@ -127,13 +126,13 @@ class StereoCamera:
         rect_r = cv2.remap(img_r, self._map1_r, self._map2_r, cv2.INTER_LINEAR)
         return rect_l, rect_r
 
-    def rectify_mono(self, img_l: np.ndarray) -> np.ndarray:
+    def rectify_mono(self, img_l) :
         """对纯单目图像执行去畸变校正"""
         if self._map1_l is None:
             return img_l
         return cv2.remap(img_l, self._map1_l, self._map2_l, cv2.INTER_LINEAR)
 
-    def project_mono(self, p_c: np.ndarray) -> np.ndarray:
+    def project_mono(self, p_c) :
         """
         单目投影: P_c = [X, Y, Z]^T -> [u, v]^T
         支持 (3,) 或 (N, 3)
@@ -150,7 +149,7 @@ class StereoCamera:
             v = self.fy * p_c[:, 1] * inv_z + self.cy
             return np.stack([u, v], axis=-1)
 
-    def project_stereo(self, p_c: np.ndarray) -> np.ndarray:
+    def project_stereo(self, p_c) :
         """
         双目投影 (对应 ORB-SLAM3 EdgeStereoSE3ProjectXYZ):
         P_c = [X, Y, Z]^T -> [u, v, u_r]^T, 其中 u_r = u - bf / Z
@@ -170,7 +169,7 @@ class StereoCamera:
             u_r = u - self.bf * inv_z
             return np.stack([u, v, u_r], axis=-1)
 
-    def unproject_depth(self, u: float, v: float, depth: float) -> np.ndarray:
+    def unproject_depth(self, u, v, depth) :
         """
         已知左目像素 (u, v) 与深度 Z 恢复相机坐标系下 3D 点 P_c = [X, Y, Z]^T
         """
@@ -179,12 +178,12 @@ class StereoCamera:
         y = (float(v) - self.cy) * z * self.inv_fy
         return np.array([x, y, z], dtype=np.float64)
 
-    def is_in_image(self, u: float, v: float, margin: float = 0.0) -> bool:
+    def is_in_image(self, u, v, margin = 0.0) :
         """判断像素坐标是否位于图像有效视野内"""
         return (margin <= u < self.width - margin) and (margin <= v < self.height - margin)
 
     @classmethod
-    def create_euroc_camera(cls) -> StereoCamera:
+    def create_euroc_camera(cls) :
         """
         创建标准 EuRoC MAV 数据集 (MH_01~05 / V1 / V2) 双目相机配置
         包含原始 cam0/cam1 内参、畸变与外参，自动完成双目极线校正初始化
@@ -219,7 +218,7 @@ class StereoCamera:
         return cam
 
     @classmethod
-    def from_calib_file(cls, calib_json_path: str) -> StereoCamera:
+    def from_calib_file(cls, calib_json_path) :
         """
         从 calibrate_stereo_camera.py 生成的 JSON 标定文件直接构建并初始化双目极线校正相机
         """

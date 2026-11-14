@@ -9,7 +9,7 @@ dataset.py
 3. WitMotionSerialIMU & LiveStereoInertialStream: 实机 USB 左右拼接双目摄像头 (1280x480) + CH340 串口 IMU (0x55 协议) 实时同步数据流。
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 import os
 import csv
 import struct
@@ -29,7 +29,7 @@ class EuRoCDataset:
     """
     标准 EuRoC MAV 数据集读取器 (如 MH_01_easy/mav0)
     """
-    def __init__(self, mav0_dir: str):
+    def __init__(self, mav0_dir):
         self.mav0_dir = mav0_dir
         self.cam0_csv = os.path.join(mav0_dir, "cam0", "data.csv")
         self.cam0_img_dir = os.path.join(mav0_dir, "cam0", "data")
@@ -37,14 +37,14 @@ class EuRoCDataset:
         self.imu_csv = os.path.join(mav0_dir, "imu0", "data.csv")
         self.gt_csv = os.path.join(mav0_dir, "state_groundtruth_estimate0", "data.csv")
 
-        self.frames: list[tuple[float, str, str]] = []
-        self.imu_data: list[ImuMeasurement] = []
-        self.gt_timestamps: np.ndarray = np.zeros(0, dtype=np.float64)
-        self.gt_positions: np.ndarray = np.zeros((0, 3), dtype=np.float64)
+        self.frames = []
+        self.imu_data = []
+        self.gt_timestamps = np.zeros(0, dtype=np.float64)
+        self.gt_positions = np.zeros((0, 3), dtype=np.float64)
 
         self._load_metadata()
 
-    def _load_metadata(self) -> None:
+    def _load_metadata(self) :
         if not os.path.exists(self.cam0_csv):
             raise FileNotFoundError(f"未找到 EuRoC cam0 数据文件: {self.cam0_csv}")
 
@@ -94,13 +94,14 @@ class EuRoCDataset:
             self.gt_timestamps = np.asarray(gt_ts, dtype=np.float64)
             self.gt_positions = np.asarray(gt_pos, dtype=np.float64)
 
-    def __len__(self) -> int:
+    def __len__(self) :
         return len(self.frames)
 
-    def get_item(self, idx: int) -> tuple[np.ndarray, np.ndarray, float, list[ImuMeasurement], np.ndarray | None]:
+    def get_item(self, idx) :
         ts, path_l, path_r = self.frames[idx]
-        img_l = cv2.imread(path_l, cv2.IMREAD_GRAYSCALE)
-        img_r = cv2.imread(path_r, cv2.IMREAD_GRAYSCALE)
+        # 兼容 OpenCV 3.4.2 在含中文路径 (视觉slam) 下的图像读取
+        img_l = cv2.imdecode(np.fromfile(path_l, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        img_r = cv2.imdecode(np.fromfile(path_r, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
 
         prev_ts = self.frames[idx - 1][0] if idx > 0 else ts - 0.05
         imus = [m for m in self.imu_data if prev_ts < m.timestamp <= ts]
@@ -121,10 +122,10 @@ class SyntheticStereoInertialDataset:
     """
     def __init__(
         self,
-        camera: StereoCamera,
-        num_frames: int = 80,
-        num_landmarks: int = 450,
-        seed: int = 2026
+        camera,
+        num_frames = 80,
+        num_landmarks = 450,
+        seed = 2026
     ):
         self.camera = camera
         self.num_frames = int(num_frames)
@@ -136,7 +137,7 @@ class SyntheticStereoInertialDataset:
         # 2. 生成平滑的 3D 闭环/曲线相机运动真值轨迹 T_wc(t)
         self.timestamps, self.gt_poses_wc, self.imu_batches = self._generate_trajectory_and_imu()
 
-    def _generate_3d_textured_world(self, n_landmarks: int) -> tuple[np.ndarray, np.ndarray]:
+    def _generate_3d_textured_world(self, n_landmarks) :
         """在环形走廊空间生成 3D 结构点及每个点的唯一局部像素微纹理模板 (9x9)"""
         pts = []
         # 分布在相机前方及环线四周 (深度 1.5m ~ 7.5m)
@@ -163,11 +164,11 @@ class SyntheticStereoInertialDataset:
                 patterns[i, :, 0:2] = 225
         return landmarks_w, patterns
 
-    def _generate_trajectory_and_imu(self) -> tuple[np.ndarray, list[SE3], list[list[ImuMeasurement]]]:
+    def _generate_trajectory_and_imu(self) :
         """生成 20 FPS 相机平滑 6DoF 轨迹与帧间 200Hz IMU 测量"""
         dt_cam = 1.0 / self.camera.fps
         timestamps = np.arange(self.num_frames, dtype=np.float64) * dt_cam
-        gt_poses_wc: list[SE3] = []
+        gt_poses_wc = []
 
         # 设计平滑的椭圆 + 波浪 3D 轨迹，首尾相接形成闭环
         for k, t in enumerate(timestamps):
@@ -185,7 +186,7 @@ class SyntheticStereoInertialDataset:
 
         # 根据解析位姿差分生成帧间 200Hz IMU 测量 (每个相机间隔 10 条 IMU)
         g_w = np.array([0.0, 0.0, -9.81], dtype=np.float64)
-        imu_batches: list[list[ImuMeasurement]] = [[]]
+        imu_batches = [[]]
         n_sub = 10
 
         for k in range(1, self.num_frames):
@@ -200,7 +201,7 @@ class SyntheticStereoInertialDataset:
             v_curr = (T_curr.t - T_prev.t) / dt_cam
             a_world = (v_curr - v_prev) / dt_cam - g_w
 
-            batch: list[ImuMeasurement] = []
+            batch = []
             for s in range(1, n_sub + 1):
                 ts_imu = t0 + s * dt_sub
                 alpha = float(s) / float(n_sub)
@@ -211,7 +212,7 @@ class SyntheticStereoInertialDataset:
 
         return timestamps, gt_poses_wc, imu_batches
 
-    def render_stereo_pair(self, T_wc: SE3) -> tuple[np.ndarray, np.ndarray]:
+    def render_stereo_pair(self, T_wc) :
         """根据给定相机位姿 T_wc 渲染左目与右目灰度图像"""
         h, w = self.camera.height, self.camera.width
         img_l = np.full((h, w), 115, dtype=np.uint8)
@@ -289,16 +290,16 @@ class WitMotionSerialIMU:
 
     def __init__(
         self,
-        port: str = "COM3",
-        baud: int = 9600,
-        R_mount: np.ndarray | None = None,
+        port = "COM3",
+        baud = 9600,
+        R_mount = None,
     ):
         self.port = str(port)
         self.baud = int(baud)
         self._lock = threading.Lock()
         self._running = False
-        self._thread: threading.Thread | None = None
-        self._win_handle: int | None = None
+        self._thread = None
+        self._win_handle = None
         self._pyserial_obj = None
 
         # 默认采用水平安装单位阵 R_mount = I_3；启动后将根据重力向量与静态欧拉角自动精化水平归零矩阵
@@ -307,7 +308,7 @@ class WitMotionSerialIMU:
         else:
             self.R_mount = np.eye(3, dtype=np.float64)
 
-        self._measurements: list[ImuMeasurement] = []
+        self._measurements = []
         self.latest_raw_acc = np.array([0.0, 0.0, 9.80665], dtype=np.float64)
         self.latest_raw_gyro = np.zeros(3, dtype=np.float64)
         self.latest_raw_euler_deg = np.zeros(3, dtype=np.float64)
@@ -322,7 +323,7 @@ class WitMotionSerialIMU:
         self._ref_tilt_deg = np.zeros(2, dtype=np.float64)
 
     @staticmethod
-    def euler_deg_to_R(eul_deg: np.ndarray) -> np.ndarray:
+    def euler_deg_to_R(eul_deg) :
         """ZYX 欧拉角 (Roll, Pitch, Yaw, 单位: deg) 转 3x3 旋转矩阵 R = Rz(yaw) @ Ry(pitch) @ Rx(roll)"""
         r, p, y = np.deg2rad(eul_deg[0]), np.deg2rad(eul_deg[1]), np.deg2rad(eul_deg[2])
         cr, sr = np.cos(r), np.sin(r)
@@ -334,7 +335,7 @@ class WitMotionSerialIMU:
         return Rz @ Ry @ Rx
 
     @staticmethod
-    def R_to_euler_deg(R: np.ndarray) -> np.ndarray:
+    def R_to_euler_deg(R) :
         """3x3 旋转矩阵反解 ZYX 欧拉角 (Roll, Pitch, Yaw, 单位: deg)"""
         sy = float(np.clip(-R[2, 0], -1.0, 1.0))
         pitch = np.arcsin(sy)
@@ -342,7 +343,7 @@ class WitMotionSerialIMU:
         yaw = np.arctan2(R[1, 0], R[0, 0])
         return np.rad2deg(np.array([roll, pitch, yaw], dtype=np.float64))
 
-    def start(self) -> bool:
+    def start(self) :
         """打开串口并启动后台高频接收线程"""
         if self._running:
             return self.is_connected
@@ -353,6 +354,8 @@ class WitMotionSerialIMU:
                 p for p in ("COM4", "COM3", "COM5", "COM6", "COM7", "COM8", "COM1", "COM2") if p != self.port
             ]
             h = -1
+            first_opened_h = -1
+            first_opened_port = self.port
             for cand in candidate_ports:
                 h_try = kernel32.CreateFileW(
                     f"\\\\.\\{cand}",
@@ -363,40 +366,85 @@ class WitMotionSerialIMU:
                     0,
                     None,
                 )
-                if h_try not in (-1, ctypes.c_void_p(-1).value, None):
+                if h_try in (-1, ctypes.c_void_p(-1).value, None):
+                    continue
+
+                dcb = _Win32DCB()
+                dcb.DCBlength = ctypes.sizeof(_Win32DCB)
+                if not kernel32.GetCommState(h_try, ctypes.byref(dcb)):
+                    kernel32.CloseHandle(h_try)
+                    continue
+                dcb.BaudRate = self.baud
+                dcb.ByteSize = 8
+                dcb.Parity = 0
+                dcb.StopBits = 0
+                dcb.fBitFields = 1
+                if not kernel32.SetCommState(h_try, ctypes.byref(dcb)):
+                    kernel32.CloseHandle(h_try)
+                    continue
+
+                timeouts = _Win32CommTimeouts(5, 1, 15, 1, 15)
+                kernel32.SetCommTimeouts(h_try, ctypes.byref(timeouts))
+                kernel32.PurgeComm(h_try, 0x0008 | 0x0004)
+
+                # 探测该串口是否有真实 0x55 维特智能 IMU 数据流到达 (避免误连无数据的虚拟串口)
+                probe_chunk = ctypes.create_string_buffer(128)
+                n_probe = wintypes.DWORD(0)
+                got_wit_pkt = False
+                t_probe = time.perf_counter()
+                while (time.perf_counter() - t_probe) < 0.15:
+                    ok_r = kernel32.ReadFile(h_try, probe_chunk, 128, ctypes.byref(n_probe), None)
+                    if ok_r and n_probe.value > 0:
+                        raw_bytes = probe_chunk.raw[: n_probe.value]
+                        if 0x55 in raw_bytes:
+                            got_wit_pkt = True
+                            break
+                    time.sleep(0.01)
+
+                if got_wit_pkt:
+                    if first_opened_h not in (-1, ctypes.c_void_p(-1).value, None):
+                        kernel32.CloseHandle(first_opened_h)
                     h = h_try
                     self.port = cand
                     break
+                else:
+                    if first_opened_h in (-1, ctypes.c_void_p(-1).value, None):
+                        first_opened_h = h_try
+                        first_opened_port = cand
+                    else:
+                        kernel32.CloseHandle(h_try)
+
             if h in (-1, ctypes.c_void_p(-1).value, None):
-                self.is_connected = False
-                return False
+                if first_opened_h not in (-1, ctypes.c_void_p(-1).value, None):
+                    h = first_opened_h
+                    self.port = first_opened_port
+                else:
+                    self.is_connected = False
+                    return False
 
-            dcb = _Win32DCB()
-            dcb.DCBlength = ctypes.sizeof(_Win32DCB)
-            if not kernel32.GetCommState(h, ctypes.byref(dcb)):
-                kernel32.CloseHandle(h)
-                self.is_connected = False
-                return False
-            dcb.BaudRate = self.baud
-            dcb.ByteSize = 8
-            dcb.Parity = 0
-            dcb.StopBits = 0
-            dcb.fBitFields = 1
-            if not kernel32.SetCommState(h, ctypes.byref(dcb)):
-                kernel32.CloseHandle(h)
-                self.is_connected = False
-                return False
-
-            timeouts = _Win32CommTimeouts(5, 1, 15, 1, 15)
-            kernel32.SetCommTimeouts(h, ctypes.byref(timeouts))
-            kernel32.PurgeComm(h, 0x0008 | 0x0004)
             self._win_handle = h
             self.is_connected = True
+            # 发送 WitMotion 临时解锁指令 + 20Hz 回传速率配置 (不写入掉电 EEPROM，仅本次会话提升帧间 IMU 采样密度至 20Hz)
+            try:
+                n_written = wintypes.DWORD(0)
+                unlock_cmd = b"\xFF\xAA\x69\x88\xB5"
+                rate_20hz_cmd = b"\xFF\xAA\x03\x07\x00"
+                kernel32.WriteFile(self._win_handle, unlock_cmd, len(unlock_cmd), ctypes.byref(n_written), None)
+                time.sleep(0.015)
+                kernel32.WriteFile(self._win_handle, rate_20hz_cmd, len(rate_20hz_cmd), ctypes.byref(n_written), None)
+            except Exception:
+                pass
         else:
             try:
                 import serial
                 self._pyserial_obj = serial.Serial(self.port, self.baud, timeout=0.02)
                 self.is_connected = True
+                try:
+                    self._pyserial_obj.write(b"\xFF\xAA\x69\x88\xB5")
+                    time.sleep(0.015)
+                    self._pyserial_obj.write(b"\xFF\xAA\x03\x07\x00")
+                except Exception:
+                    pass
             except Exception:
                 self.is_connected = False
                 return False
@@ -406,7 +454,7 @@ class WitMotionSerialIMU:
         self._thread.start()
         return True
 
-    def _read_loop(self) -> None:
+    def _read_loop(self) :
         buf = bytearray()
         has_acc = False
 
@@ -431,7 +479,7 @@ class WitMotionSerialIMU:
                 else:
                     time.sleep(0.002)
 
-    def _parse_buffer(self, buf: bytearray, has_acc: bool) -> bool:
+    def _parse_buffer(self, buf, has_acc) :
         while len(buf) >= 11:
             if buf[0] != 0x55:
                 del buf[0]
@@ -543,7 +591,7 @@ class WitMotionSerialIMU:
                     self.latest_euler_deg = np.array([rel_roll, rel_pitch, yaw], dtype=np.float64)
         return has_acc
 
-    def get_measurements_between(self, t_prev: float, t_curr: float) -> list[ImuMeasurement]:
+    def get_measurements_between(self, t_prev, t_curr) :
         """获取 (t_prev, t_curr] 区间内的所有 IMU 采样；若间隔较短尚未到达新串口包，则用最新状态零阶保持补齐"""
         with self._lock:
             batch = [m for m in self._measurements if t_prev < m.timestamp <= t_curr]
@@ -559,7 +607,7 @@ class WitMotionSerialIMU:
                 ]
             return batch
 
-    def get_status_snapshot(self) -> dict:
+    def get_status_snapshot(self) :
         with self._lock:
             return {
                 "connected": self.is_connected,
@@ -575,7 +623,7 @@ class WitMotionSerialIMU:
                 "temp_c": float(self.latest_temp_c),
             }
 
-    def close(self) -> None:
+    def close(self) :
         self._running = False
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=0.5)
@@ -591,37 +639,65 @@ class WitMotionSerialIMU:
             self._pyserial_obj = None
 
 
+def open_camera_capture(cam_id):
+    """兼容 OpenCV 3.4.2 (单参数 VideoCapture(id)) 与 OpenCV 4.x (双参数 VideoCapture(id, apiPreference)) 的摄像头打开函数"""
+    cid = int(cam_id)
+    if os.name == "nt":
+        try:
+            cap = cv2.VideoCapture(cid, cv2.CAP_DSHOW)
+            if cap is not None and cap.isOpened():
+                return cap
+            if cap is not None:
+                cap.release()
+        except TypeError:
+            cap = cv2.VideoCapture(cid)
+            if cap is not None and cap.isOpened():
+                return cap
+            if cap is not None:
+                cap.release()
+            cap = cv2.VideoCapture(cid + int(cv2.CAP_DSHOW))
+            if cap is not None and cap.isOpened():
+                return cap
+            if cap is not None:
+                cap.release()
+    return cv2.VideoCapture(cid)
+
+
 def find_stereo_camera_id(
-    preferred_id: int = -1,
-    concat_width: int = 1280,
-    height: int = 480,
-) -> int:
+    preferred_id = -1,
+    concat_width = 1280,
+    height = 480,
+) :
     """
     自动探测外部 USB 双目摄像头 (1280x480) 或外置 USB 单目摄像头 (640x480):
-    若 preferred_id >= 0 则优先验证该设备；若 preferred_id == -1 则自动扫描索引 1, 0, 2, 3，
-    优先选择支持原生 1280x480 的双目摄像头，其次选择画面有效 (非黑屏隐私盖遮挡) 的外置单目摄像头。
+    若 preferred_id >= 0 则优先验证该设备；若 preferred_id == -1 则优先扫描外置摄像头索引 [1, 2, 3]，
+    仅当所有外置摄像头均未接入时才回退至笔记本内置摄像头 (索引 0)。
     """
     if preferred_id >= 0:
         return int(preferred_id)
 
-    best_id = 1
-    for cid in [1, 0, 2, 3]:
-        cap = cv2.VideoCapture(cid, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+    best_id = None
+    for cid in [1, 2, 3, 0]:
+        cap = open_camera_capture(cid)
         if not cap.isOpened():
             cap.release()
             continue
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, concat_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         ret, frame = cap.read()
         cap.release()
+        if not ret or frame is None:
+            cap2 = open_camera_capture(cid)
+            if cap2.isOpened():
+                ret, frame = cap2.read()
+            cap2.release()
         if ret and frame is not None:
             h_actual, w_actual = frame.shape[:2]
-            if w_actual == concat_width and h_actual == height:
+            if w_actual == concat_width and h_actual == height and cid != 0:
                 return cid
-            if float(frame.std()) > 3.0 and float(frame.mean()) > 8.0:
+            if best_id is None and float(frame.std()) > 3.0 and float(frame.mean()) > 8.0:
                 best_id = cid
-    return best_id
+    return best_id if best_id is not None else 1
 
 
 class LiveStereoInertialStream:
@@ -632,13 +708,13 @@ class LiveStereoInertialStream:
 
     def __init__(
         self,
-        cam_id: int = -1,
-        concat_width: int = 1280,
-        height: int = 480,
-        imu_port: str = "COM3",
-        imu_baud: int = 9600,
-        calib_json: str = "config/custom_stereo_imu.json",
-        force_monocular: bool = False,
+        cam_id = -1,
+        concat_width = 1280,
+        height = 480,
+        imu_port = "COM3",
+        imu_baud = 9600,
+        calib_json = "config/custom_stereo_imu.json",
+        force_monocular = False,
     ):
         self.concat_width = int(concat_width)
         self.height = int(height)
@@ -649,7 +725,7 @@ class LiveStereoInertialStream:
 
         self.imu_bg = np.zeros(3, dtype=np.float64)
         self.imu_ba = np.zeros(3, dtype=np.float64)
-        self.R_imu_mount: np.ndarray | None = None
+        self.R_imu_mount = None
 
         # 1. 构建双目相机模型 (若存在标定文件则加载真实标定参数，否则采用 640x480 标准初始内参)
         if calib_json and os.path.exists(calib_json):
@@ -687,30 +763,37 @@ class LiveStereoInertialStream:
         self.imu_ok = self.imu.start()
 
         # 3. 打开 USB 摄像头并自动检测双目 (1280x480) 或单目 (640x480)
-        backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-        self.cap = cv2.VideoCapture(self.cam_id, backend)
-        if not self.cap.isOpened():
-            self.cap.release()
-            self.cap = cv2.VideoCapture(self.cam_id)
+        self.cap = open_camera_capture(self.cam_id)
         if not self.cap.isOpened():
             raise RuntimeError(f"无法打开摄像头 (cam_id={self.cam_id})")
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+        self._last_valid_frame = None
         if not self.is_monocular:
+            # 仅在首次 read() 之前尝试请求 1280x480；绝不在 read() 成功后再次调用 cap.set()，以免在 OpenCV 3.4.2 下中断视频流
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.concat_width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             ret_probe, frame_probe = self.cap.read()
+            if not ret_probe or frame_probe is None:
+                # 若摄像头不支持设置 1280x480，重新以默认分辨率打开
+                self.cap.release()
+                self.cap = open_camera_capture(self.cam_id)
+                ret_probe, frame_probe = self.cap.read()
             if ret_probe and frame_probe is not None:
+                self._last_valid_frame = frame_probe.copy()
                 hp, wp = frame_probe.shape[:2]
                 if wp != self.concat_width or hp != self.height:
-                    # 该设备不支持 1280x480 左右拼接双目，自动切换为 640x480 单目+IMU模式
+                    # 该设备不支持 1280x480 左右拼接双目，自动切换为 640x480 单目+IMU模式 (不再调用 cap.set 中断已开启的流)
                     self.is_monocular = True
-        if self.is_monocular:
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.half_w)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        else:
+            ret_probe, frame_probe = self.cap.read()
+            if ret_probe and frame_probe is not None:
+                self._last_valid_frame = frame_probe.copy()
 
-        # 预热排空摄像头首几帧缓存并等待首包 IMU 数据到达
-        for _ in range(5):
-            self.cap.read()
+        # 预热读取几帧并缓存最新有效帧
+        for _ in range(3):
+            ret_w, frm_w = self.cap.read()
+            if ret_w and frm_w is not None:
+                self._last_valid_frame = frm_w.copy()
         if self.imu_ok:
             t_wait = time.perf_counter()
             while self.imu.total_packets < 2 and (time.perf_counter() - t_wait) < 0.35:
@@ -719,15 +802,71 @@ class LiveStereoInertialStream:
         self._t0 = time.perf_counter()
         self._last_ts = 0.0
 
-    def read_frame(self) -> tuple[np.ndarray, np.ndarray, float, list[ImuMeasurement], dict]:
+        # 4. 启动后台异步摄像头抓帧线程 (消除关键帧 HF-Net 推理期间 UVC 缓冲区积压导致的延迟抖动与大光流跳变)
+        self._cam_lock = threading.Lock()
+        self._latest_frame = self._last_valid_frame.copy() if self._last_valid_frame is not None else None
+        self._latest_frame_ts = time.perf_counter()
+        self._latest_frame_seq = 0
+        self._last_consumed_seq = -1
+        self._cam_running = True
+        self._cam_thread = threading.Thread(target=self._cam_read_loop, daemon=True)
+        self._cam_thread.start()
+
+    def _cam_read_loop(self):
+        """后台高频排空摄像头硬件缓冲区，始终保存最新鲜的一帧图像及其真实曝光完成时间戳"""
+        fail_streak = 0
+        while self._cam_running and self.cap is not None:
+            ret, frm = self.cap.read()
+            if ret and frm is not None:
+                ts_now = time.perf_counter()
+                fail_streak = 0
+                with self._cam_lock:
+                    self._latest_frame = frm
+                    self._latest_frame_ts = ts_now
+                    self._latest_frame_seq += 1
+                    self._last_valid_frame = frm
+            else:
+                fail_streak += 1
+                if fail_streak >= 15:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = open_camera_capture(self.cam_id)
+                    fail_streak = 0
+                time.sleep(0.005)
+
+    def read_frame(self) :
         """
         读取一帧同步双目或单目灰度图像与帧间 IMU 数据包:
         返回 (img_l_gray, img_r_gray, timestamp_sec, imu_measurements, imu_status_dict)
         """
-        ret, frame = self.cap.read()
-        ts_perf = time.perf_counter()
-        if not ret or frame is None:
+        frame = None
+        ts_perf = None
+        # 等待后台抓帧线程产出新帧 (最长等待 45ms，若超时则立即取最新可用帧)
+        t_wait0 = time.perf_counter()
+        while (time.perf_counter() - t_wait0) < 0.045:
+            with self._cam_lock:
+                if self._latest_frame is not None and self._latest_frame_seq > self._last_consumed_seq:
+                    frame = self._latest_frame.copy()
+                    ts_perf = self._latest_frame_ts
+                    self._last_consumed_seq = self._latest_frame_seq
+                    break
+            time.sleep(0.002)
+
+        if frame is None:
+            with self._cam_lock:
+                if self._latest_frame is not None:
+                    frame = self._latest_frame.copy()
+                    ts_perf = time.perf_counter()
+                elif self._last_valid_frame is not None:
+                    frame = self._last_valid_frame.copy()
+                    ts_perf = time.perf_counter()
+
+        if frame is None:
             raise RuntimeError(f"从摄像头 (cam_id={self.cam_id}) 读取图像帧失败")
+        if ts_perf is None:
+            ts_perf = time.perf_counter()
 
         if self.is_monocular:
             if frame.shape[1] != self.half_w or frame.shape[0] != self.height:
@@ -742,7 +881,7 @@ class LiveStereoInertialStream:
             img_l = cv2.cvtColor(bgr_l, cv2.COLOR_BGR2GRAY) if bgr_l.ndim == 3 else bgr_l.copy()
             img_r = cv2.cvtColor(bgr_r, cv2.COLOR_BGR2GRAY) if bgr_r.ndim == 3 else bgr_r.copy()
 
-        rel_ts = ts_perf - self._t0
+        rel_ts = max(self._last_ts + 1e-3, ts_perf - self._t0)
         prev_perf = self._t0 + self._last_ts if self._last_ts > 0.0 else (ts_perf - 0.033)
         imu_raw = self.imu.get_measurements_between(prev_perf, ts_perf) if self.imu_ok else []
         imu_batch = [
@@ -756,7 +895,10 @@ class LiveStereoInertialStream:
         self._last_ts = rel_ts
         return img_l, img_r, rel_ts, imu_batch, self.imu.get_status_snapshot()
 
-    def close(self) -> None:
+    def close(self) :
+        self._cam_running = False
+        if hasattr(self, "_cam_thread") and self._cam_thread is not None and self._cam_thread.is_alive():
+            self._cam_thread.join(timeout=0.5)
         if self.cap is not None:
             self.cap.release()
         self.imu.close()

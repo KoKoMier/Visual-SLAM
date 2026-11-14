@@ -14,7 +14,7 @@ frontend/orb_extractor.py
    这使得仅用 500~600 个均匀特征点即可达到普通随机 1500 个点的位姿约束精度，大幅减轻 RK3566 负担！
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 import numpy as np
 import cv2
 
@@ -23,15 +23,15 @@ class ExtractorNode:
     """四叉树分裂节点 (对应 ORB-SLAM3 C++ ExtractorNode)"""
     __slots__ = ("ul", "ur", "bl", "br", "kps", "is_no_more")
 
-    def __init__(self, ul: tuple[int, int], ur: tuple[int, int], bl: tuple[int, int], br: tuple[int, int]):
+    def __init__(self, ul, ur, bl, br):
         self.ul = ul  # (x_min, y_min)
         self.ur = ur  # (x_max, y_min)
         self.bl = bl  # (x_min, y_max)
         self.br = br  # (x_max, y_max)
-        self.kps: list[cv2.KeyPoint] = []
-        self.is_no_more: bool = False
+        self.kps = []
+        self.is_no_more = False
 
-    def divide_node(self) -> list[ExtractorNode]:
+    def divide_node(self) :
         """将当前矩形节点一分为四，并将内部关键点分配至四个子节点"""
         half_x = int(np.ceil((self.ur[0] - self.ul[0]) / 2.0))
         half_y = int(np.ceil((self.br[1] - self.ul[1]) / 2.0))
@@ -69,16 +69,16 @@ class ORBExtractor:
     """
     四叉树均匀化 ORB 提取器 (对应 ORB-SLAM3 ORBextractor)
     """
-    EDGE_THRESHOLD: int = 19
-    PATCH_SIZE: int = 31
+    EDGE_THRESHOLD = 19
+    PATCH_SIZE = 31
 
     def __init__(
         self,
-        n_features: int = 600,
-        scale_factor: float = 1.2,
-        n_levels: int = 8,
-        ini_th_fast: int = 20,
-        min_th_fast: int = 7
+        n_features = 600,
+        scale_factor = 1.2,
+        n_levels = 8,
+        ini_th_fast = 20,
+        min_th_fast = 7
     ):
         self.n_features = int(n_features)
         self.scale_factor = float(scale_factor)
@@ -114,13 +114,13 @@ class ORBExtractor:
             patchSize=self.PATCH_SIZE
         )
 
-    def compute_pyramid(self, image: np.ndarray) -> list[np.ndarray]:
+    def compute_pyramid(self, image) :
         """构建 8 层图像金字塔"""
         if image.ndim == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
-        pyramid: list[np.ndarray] = [gray]
+        pyramid = [gray]
         for level in range(1, self.n_levels):
             scale = self.inv_scale_factors[level]
             sz = (
@@ -133,11 +133,10 @@ class ORBExtractor:
 
     def distribute_oct_tree(
         self,
-        kps_to_distribute: list[cv2.KeyPoint],
-        min_x: int, max_x: int,
-        min_y: int, max_y: int,
-        n_desired: int
-    ) -> list[cv2.KeyPoint]:
+        kps_to_distribute,
+        min_x, max_x,
+        min_y, max_y,
+        n_desired) :
         """
         四叉树均匀化分配算法 (对应 ORBextractor::DistributeOctTree)
         """
@@ -151,7 +150,7 @@ class ORBExtractor:
         n_ini = max(1, int(np.round(float(width) / float(height))))
         h_x = float(width) / float(n_ini)
 
-        nodes: list[ExtractorNode] = []
+        nodes = []
         for i in range(n_ini):
             x0 = int(h_x * i)
             x1 = int(h_x * (i + 1))
@@ -162,7 +161,7 @@ class ORBExtractor:
             idx = min(n_ini - 1, max(0, int(kp.pt[0] / h_x)))
             nodes[idx].kps.append(kp)
 
-        active_nodes: list[ExtractorNode] = []
+        active_nodes = []
         for node in nodes:
             if len(node.kps) == 1:
                 node.is_no_more = True
@@ -178,7 +177,7 @@ class ORBExtractor:
             # 若本轮全部展開会超过目标数，按节点内角点数从多到少优先分裂
             if len(active_nodes) + len(splittable) * 3 > n_desired:
                 splittable.sort(key=lambda n: len(n.kps), reverse=True)
-                new_nodes: list[ExtractorNode] = [n for n in active_nodes if n.is_no_more or len(n.kps) <= 1]
+                new_nodes = [n for n in active_nodes if n.is_no_more or len(n.kps) <= 1]
                 split_done = False
                 for idx_n, node in enumerate(splittable):
                     if not split_done:
@@ -192,7 +191,7 @@ class ORBExtractor:
                 active_nodes = new_nodes
                 break
             else:
-                next_nodes: list[ExtractorNode] = []
+                next_nodes = []
                 for node in active_nodes:
                     if node.is_no_more or len(node.kps) <= 1:
                         next_nodes.append(node)
@@ -201,7 +200,7 @@ class ORBExtractor:
                 active_nodes = next_nodes
 
         # 每个叶子节点保留响应值 (response) 最大的角点
-        result_kps: list[cv2.KeyPoint] = []
+        result_kps = []
         for node in active_nodes:
             if len(node.kps) > 0:
                 best_kp = max(node.kps, key=lambda k: k.response)
@@ -210,8 +209,7 @@ class ORBExtractor:
 
     def extract(
         self,
-        image: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+        image) :
         """
         执行完整的多尺度四叉树均匀化 ORB 提取与描述子计算
         返回:
@@ -221,10 +219,10 @@ class ORBExtractor:
             descriptors: (N, 32) uint8 256-bit ORB 二进制描述子
         """
         pyramid = self.compute_pyramid(image)
-        all_pts: list[tuple[float, float]] = []
-        all_octaves: list[int] = []
-        all_angles: list[float] = []
-        all_descs: list[np.ndarray] = []
+        all_pts = []
+        all_octaves = []
+        all_angles = []
+        all_descs = []
 
         cell_size = 35  # 网格尺寸 (像素)
         border = self.EDGE_THRESHOLD
@@ -238,7 +236,7 @@ class ORBExtractor:
             if max_x <= min_x or max_y <= min_y:
                 continue
 
-            level_kps: list[cv2.KeyPoint] = []
+            level_kps = []
             if image.shape[1] == 640:
                 # 实机 640x480 实时高速通道: 仅在前 4 层金字塔执行单次 C++ FAST 检测 + 局部关键点梯度张量评估 (免去全图 5 次 float32 滤波与开方)
                 roi = img_lvl[min_y:max_y, min_x:max_x]

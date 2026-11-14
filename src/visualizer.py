@@ -11,7 +11,7 @@ SLAM 摄像头 6DoF 运动视锥体 (Camera Frustum) 与实时算法状态流程
 合成为 1920x1080 全高清 MP4 视频、GIF 动图与关键阶段分镜流程图，并统一保存至 outputs/ 目录。
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 import os
 from dataclasses import dataclass, field
 import cv2
@@ -27,7 +27,7 @@ class FrameVisRecord:
     img_rect_l: np.ndarray                      # 去畸变后的左目灰度图
     R_wc_raw: np.ndarray                        # (3, 3) 原始估计旋转
     t_wc_raw: np.ndarray                        # (3,) 原始估计平移
-    gt_pos: np.ndarray | None                   # (3,) 真值位置
+    gt_pos: object                              # (3,) 真值位置
     keypoints_uv: np.ndarray                    # (M, 2) 当前帧跟踪到的有效内点像素坐标
     keypoints_depth: np.ndarray                 # (M,) 对应深度
     prev_uv: np.ndarray                         # (K, 2) 光流跟踪上一帧像素坐标
@@ -43,7 +43,7 @@ class FrameVisRecord:
     backend_ms: float                           # 后端耗时 (ms)
 
 
-def _load_chinese_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _load_chinese_font(size, bold = False) :
     """加载 Windows 微软雅黑或黑体以支持高清中文渲染"""
     candidates = [
         "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
@@ -63,7 +63,7 @@ def _load_chinese_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont 
 class SLAMVideoFlowVisualizer:
     """生成 1920x1080 摄像头 6DoF 运动与算法状态流程图视频"""
 
-    def __init__(self, width: int = 1920, height: int = 1080) -> None:
+    def __init__(self, width = 1920, height = 1080) :
         self.width = width
         self.height = height
         self.font_title = _load_chinese_font(24, bold=True)
@@ -75,14 +75,14 @@ class SLAMVideoFlowVisualizer:
 
     @staticmethod
     def _project_3d_to_2d(
-        pts_3d: np.ndarray,
-        center_3d: np.ndarray,
-        yaw_deg: float,
-        pitch_deg: float,
-        scale: float,
-        canvas_cx: float,
-        canvas_cy: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        pts_3d,
+        center_3d,
+        yaw_deg,
+        pitch_deg,
+        scale,
+        canvas_cx,
+        canvas_cy,
+    ) :
         """
         将对齐后的世界系 3D 点 (X, Y, Z) 投影到 3D 轴测/透视画布平面
         使得轨迹、点云与 3D 摄像头视锥体具有清晰的立体纵深感
@@ -114,20 +114,20 @@ class SLAMVideoFlowVisualizer:
 
     def _draw_camera_frustum_3d(
         self,
-        canvas: np.ndarray,
-        R_wc: np.ndarray,
-        t_wc: np.ndarray,
-        center_3d: np.ndarray,
-        yaw_deg: float,
-        pitch_deg: float,
-        scale: float,
-        cx: float,
-        cy: float,
-        frustum_size: float = 0.28,
-        color_bgr: tuple[int, int, int] = (40, 60, 255),
-        thickness: int = 2,
-        draw_axes: bool = True,
-    ) -> np.ndarray:
+        canvas,
+        R_wc,
+        t_wc,
+        center_3d,
+        yaw_deg,
+        pitch_deg,
+        scale,
+        cx,
+        cy,
+        frustum_size = 0.28,
+        color_bgr = (40, 60, 255),
+        thickness = 2,
+        draw_axes = True,
+    ) :
         """在 3D 视图中绘制摄像头的五面体视锥 (Camera Frustum Pyramid) 与局部坐标轴"""
         w = frustum_size * 0.75
         h = frustum_size * 0.50
@@ -176,14 +176,14 @@ class SLAMVideoFlowVisualizer:
 
     def render_all_outputs(
         self,
-        records: list[FrameVisRecord],
-        R_align: np.ndarray,
-        t_align: np.ndarray,
-        ate_metrics: dict[str, float],
-        output_dir: str,
-        prefix: str = "euroc",
-        fps: int = 15,
-    ) -> dict[str, str]:
+        records,
+        R_align,
+        t_align,
+        ate_metrics,
+        output_dir,
+        prefix = "euroc",
+        fps = 15,
+    ) :
         """
         渲染完整视频流程图 (.mp4)、动图 (.gif) 与多阶段分镜汇总图 (.png)
         """
@@ -215,16 +215,19 @@ class SLAMVideoFlowVisualizer:
         span_max = float(np.max(np.ptp(all_traj_pts, axis=0)))
         scale_3d = 470.0 / max(2.2, span_max)
 
-        # 初始化 MP4 编码器
+        # 初始化 MP4 编码器 (兼容 OpenCV 3.4.2 含中文路径写视频)
+        import shutil
+        import tempfile
+        tmp_mp4_path = os.path.join(tempfile.gettempdir(), f"{prefix}_slam_flow_tmp.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(mp4_path, fourcc, float(fps), (self.width, self.height))
+        writer = cv2.VideoWriter(tmp_mp4_path, fourcc, float(fps), (self.width, self.height))
 
-        gif_frames: list[Image.Image] = []
-        storyboard_snapshots: list[tuple[int, np.ndarray]] = []
+        gif_frames = []
+        storyboard_snapshots = []
         snapshot_indices = set(np.linspace(0, n_frames - 1, min(6, n_frames), dtype=int).tolist())
 
         # 记录历史关键帧的对齐位姿列表
-        kf_history: list[tuple[np.ndarray, np.ndarray]] = []
+        kf_history = []
 
         for idx, rec in enumerate(records):
             if rec.is_keyframe or idx == 0:
@@ -260,6 +263,13 @@ class SLAMVideoFlowVisualizer:
                 storyboard_snapshots.append((idx, frame_bgr.copy()))
 
         writer.release()
+        if os.path.exists(tmp_mp4_path):
+            if os.path.exists(mp4_path):
+                try:
+                    os.remove(mp4_path)
+                except OSError:
+                    pass
+            shutil.move(tmp_mp4_path, mp4_path)
 
         # 保存 GIF 动图
         if len(gif_frames) > 0:
@@ -287,20 +297,20 @@ class SLAMVideoFlowVisualizer:
 
     def _render_single_dashboard_frame(
         self,
-        idx: int,
-        total_frames: int,
-        rec: FrameVisRecord,
-        aligned_t_wc: np.ndarray,
-        aligned_R_wc: np.ndarray,
-        gt_positions: np.ndarray,
-        kf_history: list[tuple[np.ndarray, np.ndarray]],
-        R_align: np.ndarray,
-        t_align: np.ndarray,
-        center_3d: np.ndarray,
-        scale_3d: float,
-        ate_rmse_cm: float,
-        records: list[FrameVisRecord],
-    ) -> np.ndarray:
+        idx,
+        total_frames,
+        rec,
+        aligned_t_wc,
+        aligned_R_wc,
+        gt_positions,
+        kf_history,
+        R_align,
+        t_align,
+        center_3d,
+        scale_3d,
+        ate_rmse_cm,
+        records,
+    ) :
         """合成单帧 1920x1080 四分区可视化画面"""
         # 深色科技感背景画布 (BGR)
         canvas = np.full((self.height, self.width, 3), (24, 20, 16), dtype=np.uint8)
@@ -448,7 +458,7 @@ class SLAMVideoFlowVisualizer:
         td_cx, td_cy = 1130.0, 900.0
         td_scale = 82.0
 
-        def to_td_uv(xyz: np.ndarray) -> np.ndarray:
+        def to_td_uv(xyz) :
             rel = xyz - center_3d.reshape(-1, 3)
             u = td_cx + rel[:, 0] * td_scale
             v = td_cy - rel[:, 1] * td_scale
@@ -486,11 +496,11 @@ class SLAMVideoFlowVisualizer:
         val_min = float(min(np.min(aligned_t_wc), np.min(gt_positions))) - 0.2
         val_max = float(max(np.max(aligned_t_wc), np.max(gt_positions))) + 0.2
 
-        def val_to_py(v: float) -> int:
+        def val_to_py(v) :
             norm = (v - val_min) / max(1e-5, val_max - val_min)
             return int(round(plot_y0 + plot_h - 12 - norm * (plot_h - 24)))
 
-        def idx_to_px(k_idx: int) -> int:
+        def idx_to_px(k_idx) :
             return int(round(plot_x0 + 10 + (k_idx / max(1, total_frames - 1)) * (plot_w - 20)))
 
         axis_colors_gt = [(120, 120, 180), (120, 180, 120), (180, 140, 100)]
@@ -539,8 +549,8 @@ class SLAMVideoFlowVisualizer:
         draw.text((950, 20), status_str, font=self.font_body_bold, fill=(120, 230, 255))
 
         # 左上面板标题与 HUD
-        mode_tag = "【关键帧路径: 四叉树 ORB + 双目匹配】" if rec.is_keyframe else (
-            "【普通帧快速路径: 金字塔 LK 光流跟踪】" if rec.used_optical_flow else "【普通帧重匹配路径: ORB 描述子投影】"
+        mode_tag = "【关键帧路径: HF-Net 深度特征 + 四叉树双目匹配】" if rec.is_keyframe else (
+            "【普通帧快速路径: 金字塔 LK 光流跟踪】" if rec.used_optical_flow else "【普通帧重匹配路径: HF-Net 描述子投影】"
         )
         mode_color = (255, 190, 60) if rec.is_keyframe else (100, 245, 140)
         draw.text((32, 86), f"1. 实时左目去畸变相机视图 & 2D 特征跟踪光流场   {mode_tag}", font=self.font_h2, fill=mode_color)
@@ -569,12 +579,12 @@ class SLAMVideoFlowVisualizer:
 
     def _draw_pipeline_flowchart_boxes(
         self,
-        canvas: np.ndarray,
-        rec: FrameVisRecord,
-        idx: int,
-        total_frames: int,
-        records: list[FrameVisRecord],
-    ) -> None:
+        canvas,
+        rec,
+        idx,
+        total_frames,
+        records,
+    ) :
         """在左下面板绘制动态高亮的算法流程图节点框与连接箭头"""
         # 节点坐标定义 (x1, y1, x2, y2)
         b_input = (36, 640, 240, 735)
@@ -586,7 +596,7 @@ class SLAMVideoFlowVisualizer:
         b_moba = (610, 640, 860, 735)     # 局部地图投影 + 4轮鲁棒 Motion-only BA
         b_localba = (610, 765, 860, 860)  # 后端局部建图 (Schur 消元 Local BA + 冗余剔除)
 
-        def draw_node(box: tuple[int, int, int, int], active: bool, active_bgr: tuple[int, int, int]) -> None:
+        def draw_node(box, active, active_bgr) :
             x1, y1, x2, y2 = box
             if active:
                 # 激活态发光底色与高亮粗边框
@@ -643,7 +653,7 @@ class SLAMVideoFlowVisualizer:
             c_bar = (0, 180, 255) if r_k.is_keyframe else (100, 230, 120)
             cv2.rectangle(canvas, (px, ry0 + rh - 10 - fe_h), (px + bar_w, ry0 + rh - 10), c_bar, -1)
 
-    def _draw_pipeline_flowchart_texts(self, draw: ImageDraw.ImageDraw, rec: FrameVisRecord) -> None:
+    def _draw_pipeline_flowchart_texts(self, draw, rec) :
         """在左下面板流程图框内绘制文字说明"""
         draw.text((32, 598), "2. 实时算法执行状态流程图 (高亮当前帧激活算子与耗时分布)", font=self.font_h2, fill=(240, 230, 215))
 
@@ -669,9 +679,9 @@ class SLAMVideoFlowVisualizer:
         path_b_active = rec.is_keyframe or (not rec.used_optical_flow)
         col_b = (255, 200, 70) if path_b_active else (140, 135, 130)
         status_b = "● [当前激活]" if path_b_active else "○ [本帧待机]"
-        draw.text((297, 775), f"③-B 关键帧特征提取路径 {status_b}", font=self.font_body_bold, fill=col_b)
-        draw.text((297, 801), "8层金字塔四叉树 ORB + 零均值SAD双目", font=self.font_tiny, fill=col_b)
-        draw.text((297, 821), "补充新视角高各向同性 3D 特征点", font=self.font_tiny, fill=col_b)
+        draw.text((297, 775), f"③-B 关键帧 HF-Net 深度特征路径 {status_b}", font=self.font_body_bold, fill=col_b)
+        draw.text((297, 801), "HF-Net (scores_dense+local_desc) + 四叉树", font=self.font_tiny, fill=col_b)
+        draw.text((297, 821), "补充新视角深度语义 + 3D 双目特征点", font=self.font_tiny, fill=col_b)
 
         # 节点 4: Motion-only BA
         draw.text((622, 650), "④ 局部地图 + Motion-only BA", font=self.font_body_bold, fill=(130, 240, 245))
@@ -696,10 +706,10 @@ class SLAMVideoFlowVisualizer:
 
     def _save_storyboard_image(
         self,
-        snapshots: list[tuple[int, np.ndarray]],
-        out_path: str,
-        ate_metrics: dict[str, float],
-    ) -> None:
+        snapshots,
+        out_path,
+        ate_metrics,
+    ) :
         """将 6 个关键阶段的完整仪表盘画面拼接成一张高清运动过程分镜大图"""
         if len(snapshots) == 0:
             return
@@ -727,8 +737,7 @@ class SLAMVideoFlowVisualizer:
             f"中位数误差 = {ate_metrics['aligned_median_m']*100:.2f} cm)"
         )
         draw.text((24, 20), title, font=self.font_title, fill=(255, 235, 180))
-        final_bgr = cv2.cvtColor(np.asarray(pil_board), cv2.COLOR_RGB2BGR)
-        cv2.imwrite(out_path, final_bgr)
+        pil_board.save(out_path)
 
 
 class Live3DTrajectorySketch:
@@ -741,25 +750,25 @@ class Live3DTrajectorySketch:
     支持与 1280x480 实时双目画面上下拼接为 1280x980 一体化监控大屏，并实时输出高清简图文件。
     """
 
-    def __init__(self, width: int = 1280, height: int = 500) -> None:
+    def __init__(self, width = 1280, height = 500) :
         self.width = int(width)
         self.height = int(height)
         self.yaw_deg = -35.0
         self.pitch_deg = 26.0
-        self.traj_history: list[np.ndarray] = []
-        self.rot_history: list[np.ndarray] = []
-        self.kf_positions: list[np.ndarray] = []
-        self.euler_history: list[np.ndarray] = []
-        self.ts_history: list[float] = []
+        self.traj_history = []
+        self.rot_history = []
+        self.kf_positions = []
+        self.euler_history = []
+        self.ts_history = []
 
-    def reset(self) -> None:
+    def reset(self) :
         self.traj_history.clear()
         self.rot_history.clear()
         self.kf_positions.clear()
         self.euler_history.clear()
         self.ts_history.clear()
 
-    def handle_key(self, key: int) -> bool:
+    def handle_key(self, key) :
         """处理键盘交互: A/D 旋转 3D 视角偏航角, W/S 调整俯仰角, R 重置轨迹, Q 退出"""
         if key in (ord("q"), ord("Q")):
             return False
@@ -777,12 +786,12 @@ class Live3DTrajectorySketch:
 
     def _project_3d(
         self,
-        pts_w: np.ndarray,
-        center_w: np.ndarray,
-        scale_px: float,
-        cx: float,
-        cy: float,
-    ) -> np.ndarray:
+        pts_w,
+        center_w,
+        scale_px,
+        cx,
+        cy,
+    ) :
         """将世界系 (X右, Y下, Z前) 3D 点投影到 2D 轴测透视画布"""
         if len(pts_w) == 0:
             return np.empty((0, 2), dtype=np.int32)
@@ -812,22 +821,22 @@ class Live3DTrajectorySketch:
 
     def update_and_render(
         self,
-        frame_idx: int,
-        timestamp: float,
-        R_wc: np.ndarray,
-        t_wc: np.ndarray,
-        map_points_w: np.ndarray,
-        is_keyframe: bool,
-        tracking_state_name: str,
-        num_kfs: int,
-        num_mps: int,
-        inliers: int,
-        imu_acc: np.ndarray,
-        imu_gyro: np.ndarray,
-        imu_euler_deg: np.ndarray,
-        fps: float,
-        stereo_top_hud: np.ndarray | None = None,
-    ) -> np.ndarray:
+        frame_idx,
+        timestamp,
+        R_wc,
+        t_wc,
+        map_points_w,
+        is_keyframe,
+        tracking_state_name,
+        num_kfs,
+        num_mps,
+        inliers,
+        imu_acc,
+        imu_gyro,
+        imu_euler_deg,
+        fps,
+        stereo_top_hud = None,
+    ) :
         """
         更新当前帧 6DoF 位姿并渲染 1280x500 实时 3D 轨迹简图面板
         (若传入 stereo_top_hud 则自动拼接为上双目画面 + 下 3D 简图的一体化画布)
@@ -985,7 +994,7 @@ class Live3DTrajectorySketch:
         xz_span = max(0.30, float(np.max(np.ptp(xz_pts, axis=0))) * 1.3 + 0.15)
         scale_td = (radius_px * 0.82) / (0.5 * xz_span)
 
-        def _to_td_px(x_val: float, z_val: float) -> tuple[int, int]:
+        def _to_td_px(x_val, z_val) :
             u = int(np.clip(cx_td + (x_val - xz_center[0]) * scale_td, 538, 892))
             v = int(np.clip(cy_td - (z_val - xz_center[1]) * scale_td, 46, self.height - 20))
             return u, v

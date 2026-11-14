@@ -7,7 +7,7 @@ frontend/stereo_matcher.py
 并集成针对 RK3566 Cortex-A55 优化的双向金字塔 LK 光流快速跟踪路径。
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 from typing import TYPE_CHECKING
 import numpy as np
 import cv2
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 _POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.int32)
 
 
-def descriptor_distance(d1: np.ndarray, d2: np.ndarray) -> int:
+def descriptor_distance(d1, d2) :
     """
     计算两个 256-bit (32 bytes) ORB 描述子的汉明距离 (0 ~ 256)
     对应 ORB-SLAM3 ORBmatcher::DescriptorDistance
@@ -31,7 +31,7 @@ def descriptor_distance(d1: np.ndarray, d2: np.ndarray) -> int:
     return int(_POPCOUNT_TABLE[np.bitwise_xor(d1, d2)].sum())
 
 
-def descriptor_distance_batch(d1: np.ndarray, d2_mat: np.ndarray) -> np.ndarray:
+def descriptor_distance_batch(d1, d2_mat) :
     """
     计算单个描述子 d1 (32,) 与一组描述子 d2_mat (M, 32) 的汉明距离向量 (M,)
     """
@@ -47,18 +47,18 @@ class StereoMatcher:
     3. 局部地图点投影匹配 (search_by_projection)
     4. 共视关键帧对极几何三角化匹配 (search_for_triangulation)
     """
-    TH_HIGH: int = 100
-    TH_LOW: int = 50
+    TH_HIGH = 100
+    TH_LOW = 50
 
     @staticmethod
     def compute_stereo_matches(
-        img_left: np.ndarray,
-        img_right: np.ndarray,
-        kp_pts: np.ndarray,
-        camera: StereoCamera,
-        min_disparity: float = 2.0,
-        max_disparity: float = 80.0
-    ) -> tuple[np.ndarray, np.ndarray]:
+        img_left,
+        img_right,
+        kp_pts,
+        camera,
+        min_disparity = 2.0,
+        max_disparity = 80.0
+    ) :
         """
         对左目特征点 kp_pts (N, 2) 计算右目极线匹配横坐标 u_right 与物理深度 depths
         严格对齐 ORB-SLAM3 Frame::ComputeStereoMatches 极线扫描 + 归一化块匹配 + 左右一致性校验 + 抛物线亚像素精化:
@@ -151,13 +151,13 @@ class StereoMatcher:
 
     @staticmethod
     def track_optical_flow(
-        prev_frame: Frame,
-        curr_img_left: np.ndarray,
-        curr_img_right: np.ndarray,
-        camera: StereoCamera,
-        T_cw_pred: object | None = None,
-        fb_threshold: float = 1.5
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[MapPoint | None]]:
+        prev_frame,
+        curr_img_left,
+        curr_img_right,
+        camera,
+        T_cw_pred = None,
+        fb_threshold = 1.5
+    ) :
         """
         RK3566 普通帧快速路径:
         对上一帧中已关联有效 MapPoint 的特征点执行带 IMU/恒速运动先验的双向金字塔 LK 光流跟踪，
@@ -228,7 +228,7 @@ class StereoMatcher:
         fb_err = np.linalg.norm(pts_prev_2d - pts_back_2d, axis=1)
 
         tracked_pts = []
-        tracked_mps: list[MapPoint | None] = []
+        tracked_mps = []
         for idx_local, orig_idx in enumerate(valid_indices):
             if st_fwd[idx_local, 0] == 1 and st_bwd[idx_local, 0] == 1 and fb_err[idx_local] <= fb_threshold:
                 u, v = float(pts_curr_2d[idx_local, 0]), float(pts_curr_2d[idx_local, 1])
@@ -256,10 +256,10 @@ class StereoMatcher:
     @classmethod
     def search_by_projection(
         cls,
-        frame: Frame,
-        local_mappoints: list[MapPoint],
-        th_radius: float = 5.0
-    ) -> int:
+        frame,
+        local_mappoints,
+        th_radius = 5.0
+    ) :
         """
         将局部地图点投影到当前帧，在 64x48 空间网格内进行 ORB 描述子汉明距离匹配
         对应 ORB-SLAM3 ORBmatcher::SearchByProjection(Frame &F, const vector<MapPoint*> &vpMapPoints)
@@ -314,9 +314,8 @@ class StereoMatcher:
     @classmethod
     def search_for_triangulation(
         cls,
-        kf1: KeyFrame,
-        kf2: KeyFrame
-    ) -> list[tuple[int, int]]:
+        kf1,
+        kf2) :
         """
         在两个共视关键帧之间搜索未匹配的特征点对，利用极线几何约束 (Essential Matrix)
         与 ORB 汉明距离筛选用于三角化新 3D 地图点的匹配对 (idx1, idx2)。
@@ -361,7 +360,7 @@ class StereoMatcher:
         # 一次性向量化计算 N1 x N2 汉明距离矩阵，省去 Python 逐点全量广播与完整排序开销
         dist_mat = _POPCOUNT_TABLE[desc1_sub[:, None, :] ^ desc2_sub[None, :, :]].sum(axis=-1)
         used_2 = set()
-        matches: list[tuple[int, int]] = []
+        matches = []
 
         for row_i, idx1 in enumerate(unmatched_1):
             lvl1 = int(kf1.kp_octaves[idx1])

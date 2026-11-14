@@ -22,7 +22,7 @@ backend/local_mapper.py
    若某共视关键帧 90% 以上的地图点能被至少 3 个其他关键帧在相同或更精细金字塔尺度下观测到，将其剔除。
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 from typing import TYPE_CHECKING
 import numpy as np
 
@@ -38,12 +38,12 @@ if TYPE_CHECKING:
 class LocalMapper:
     __slots__ = ("slam_map", "recent_added_mappoints", "max_local_kfs")
 
-    def __init__(self, slam_map: Map, max_local_kfs: int = 8):
+    def __init__(self, slam_map, max_local_kfs = 8):
         self.slam_map = slam_map
-        self.recent_added_mappoints: list[MapPoint] = []
+        self.recent_added_mappoints = []
         self.max_local_kfs = int(max_local_kfs)
 
-    def run_for_keyframe(self, curr_kf: KeyFrame) -> None:
+    def run_for_keyframe(self, curr_kf) :
         """对新插入的关键帧执行完整的 ORB-SLAM3 局部建图流水线"""
         # 1. 处理新关键帧并更新共视图拓扑
         self.process_new_keyframe(curr_kf)
@@ -88,7 +88,7 @@ class LocalMapper:
         # 7. 剔除冗余关键帧 (控制 RK3566 内存与后端规模)
         self.keyframe_culling(curr_kf)
 
-    def process_new_keyframe(self, curr_kf: KeyFrame) -> None:
+    def process_new_keyframe(self, curr_kf) :
         """对应 LocalMapping::ProcessNewKeyFrame()"""
         for idx, mp in enumerate(curr_kf.map_points):
             if mp is not None and not mp.is_bad:
@@ -102,7 +102,7 @@ class LocalMapper:
         curr_kf.update_connections()
         self.slam_map.add_keyframe(curr_kf)
 
-    def map_point_culling(self, curr_kf: KeyFrame) -> None:
+    def map_point_culling(self, curr_kf) :
         """
         对应 LocalMapping::MapPointCulling()
         剔除跟踪率低或观测不足的近期新增地图点
@@ -110,7 +110,7 @@ class LocalMapper:
         is_mono_kf = bool(curr_kf.num_kps > 0 and np.all(curr_kf.depths < 0.0))
         cn_th = 2 if is_mono_kf else 3  # 单目要求至少 2 个关键帧观测，双目要求至少 3 个
         curr_kf_id = curr_kf.id
-        surviving: list[MapPoint] = []
+        surviving = []
 
         for mp in self.recent_added_mappoints:
             if mp.is_bad:
@@ -133,7 +133,7 @@ class LocalMapper:
                 if not mp.is_bad and mp.num_observations() == 0 and (curr_kf.frame_id - mp.first_frame_id) >= 3:
                     mp.set_bad_flag(self.slam_map)
 
-    def create_new_mappoints(self, curr_kf: KeyFrame) -> None:
+    def create_new_mappoints(self, curr_kf) :
         """
         对应 LocalMapping::CreateNewMapPoints()
         包含两部分:
@@ -186,7 +186,7 @@ class LocalMapper:
                 cos_stereo2 = float(np.cos(2.0 * np.arctan2(kf2.camera.baseline * 0.5, d2))) if d2 > 0.60 else 2.0
                 cos_stereo = min(cos_stereo1, cos_stereo2)
 
-                pos_w: np.ndarray | None = None
+                pos_w = None
                 can_dlt = (
                     (0.0 < cos_parallax < 0.9998)
                     if is_mono_kf
@@ -294,9 +294,9 @@ class LocalMapper:
                     self.slam_map.add_mappoint(mp)
                     self.recent_added_mappoints.append(mp)
 
-    def create_close_stereo_mappoints(self, curr_kf: KeyFrame) -> None:
+    def create_close_stereo_mappoints(self, curr_kf) :
         """对当前关键帧剩余未匹配的高质量近距离双目点 (0.60m < Z < th_depth) 补充生成 MapPoint"""
-        unmatched_stereo: list[tuple[float, int]] = []
+        unmatched_stereo = []
         for i in range(curr_kf.num_kps):
             if curr_kf.map_points[i] is None and 0.60 < curr_kf.depths[i] < curr_kf.camera.th_depth:
                 unmatched_stereo.append((float(curr_kf.depths[i]), i))
@@ -315,7 +315,7 @@ class LocalMapper:
             self.slam_map.add_mappoint(mp)
             self.recent_added_mappoints.append(mp)
 
-    def search_in_neighbors(self, curr_kf: KeyFrame) -> None:
+    def search_in_neighbors(self, curr_kf) :
         """
         对应 LocalMapping::SearchInNeighbors()
         将当前关键帧的地图点投影到一阶/二阶共视关键帧中进行融合 (Fuse)，反之亦然。
@@ -323,7 +323,7 @@ class LocalMapper:
         is_live_mono = bool(curr_kf.camera.width == 640 and curr_kf.num_kps > 0 and np.all(curr_kf.depths < 0.0))
         n_first = 1 if is_live_mono else 10
         n_second = 0 if is_live_mono else 5
-        target_kfs: set[KeyFrame] = set()
+        target_kfs = set()
         for cov_kf in curr_kf.get_best_covisibility_keyframes(n_first):
             if cov_kf.is_bad:
                 continue
@@ -339,7 +339,7 @@ class LocalMapper:
             self._fuse(tkf, curr_mps)
 
         # 收集邻居关键帧的地图点反向融合到当前关键帧
-        neigh_mps_set: set[MapPoint] = set()
+        neigh_mps_set = set()
         for tkf in sorted_target_kfs:
             for mp in tkf.map_points:
                 if mp is not None and not mp.is_bad and not mp.is_in_keyframe(curr_kf):
@@ -352,7 +352,7 @@ class LocalMapper:
                 mp.update_normal_and_depth()
         curr_kf.update_connections()
 
-    def _fuse(self, kf: KeyFrame, mappoints: list[MapPoint], th: float = 3.0) -> int:
+    def _fuse(self, kf, mappoints, th = 3.0) :
         """
         对应 ORBmatcher::Fuse(KeyFrame *pKF, const vector<MapPoint*> &vpMapPoints)
         将 mappoints 投影到关键帧 kf 中，若匹配到特征点则合并重复观测。
@@ -420,7 +420,7 @@ class LocalMapper:
 
         return fused_count
 
-    def keyframe_culling(self, curr_kf: KeyFrame) -> None:
+    def keyframe_culling(self, curr_kf) :
         """
         对应 LocalMapping::KeyFrameCulling()
         冗余关键帧剔除准则:

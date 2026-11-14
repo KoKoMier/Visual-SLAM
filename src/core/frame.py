@@ -14,7 +14,7 @@ core/frame.py
 3. 维护相机位姿 T_cw (世界到相机 SE3) 及 IMU 状态 (速度 v_w, 陀螺仪零偏 bg, 加速度计零偏 ba)。
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 from typing import TYPE_CHECKING
 import numpy as np
 
@@ -27,9 +27,9 @@ if TYPE_CHECKING:
 
 
 class Frame:
-    _next_id: int = 0
-    FRAME_GRID_COLS: int = 64
-    FRAME_GRID_ROWS: int = 48
+    _next_id = 0
+    FRAME_GRID_COLS = 64
+    FRAME_GRID_ROWS = 48
 
     __slots__ = (
         "id", "timestamp", "camera",
@@ -49,17 +49,17 @@ class Frame:
 
     def __init__(
         self,
-        timestamp: float,
-        camera: StereoCamera,
-        img_left: np.ndarray | None = None,
-        img_right: np.ndarray | None = None,
-        kp_pts: np.ndarray | None = None,
-        kp_octaves: np.ndarray | None = None,
-        kp_angles: np.ndarray | None = None,
-        descriptors: np.ndarray | None = None,
-        u_right: np.ndarray | None = None,
-        depths: np.ndarray | None = None,
-        scale_factors: np.ndarray | None = None
+        timestamp,
+        camera,
+        img_left = None,
+        img_right = None,
+        kp_pts = None,
+        kp_octaves = None,
+        kp_angles = None,
+        descriptors = None,
+        u_right = None,
+        depths = None,
+        scale_factors = None
     ):
         self.id = Frame._next_id
         Frame._next_id += 1
@@ -98,17 +98,17 @@ class Frame:
         else:
             self.depths = np.asarray(depths, dtype=np.float32).reshape(self.num_kps)
 
-        self.map_points: list[MapPoint | None] = [None] * self.num_kps
-        self.outliers: np.ndarray = np.zeros(self.num_kps, dtype=bool)
+        self.map_points = [None] * self.num_kps
+        self.outliers = np.zeros(self.num_kps, dtype=bool)
 
         # 位姿与 IMU 运动状态
-        self.T_cw: SE3 = SE3.identity()
-        self.has_pose: bool = False
-        self.v_w: np.ndarray = np.zeros(3, dtype=np.float64)
-        self.bg: np.ndarray = np.zeros(3, dtype=np.float64)
-        self.ba: np.ndarray = np.zeros(3, dtype=np.float64)
-        self.R_cw_imu_prior: np.ndarray | None = None
-        self.ref_kf: KeyFrame | None = None
+        self.T_cw = SE3.identity()
+        self.has_pose = False
+        self.v_w = np.zeros(3, dtype=np.float64)
+        self.bg = np.zeros(3, dtype=np.float64)
+        self.ba = np.zeros(3, dtype=np.float64)
+        self.R_cw_imu_prior = None
+        self.ref_kf = None
 
         # 金字塔尺度因子与不确定度权重 (ORB-SLAM3 标准 8 层金字塔, 缩放比 1.2)
         if scale_factors is None:
@@ -122,13 +122,13 @@ class Frame:
         # 64 x 48 空间加速网格 (对应 Frame::AssignFeaturesToGrid)
         self.grid_element_width_inv = float(self.FRAME_GRID_COLS) / float(self.camera.width)
         self.grid_element_height_inv = float(self.FRAME_GRID_ROWS) / float(self.camera.height)
-        self.grid: list[list[list[int]]] = [
+        self.grid = [
             [[] for _ in range(self.FRAME_GRID_ROWS)]
             for _ in range(self.FRAME_GRID_COLS)
         ]
         self.assign_features_to_grid()
 
-    def assign_features_to_grid(self) -> None:
+    def assign_features_to_grid(self) :
         """将当前帧所有特征点分配至 64x48 空间网格桶中"""
         for c in range(self.FRAME_GRID_COLS):
             for r in range(self.FRAME_GRID_ROWS):
@@ -141,19 +141,19 @@ class Frame:
             if 0 <= gx < self.FRAME_GRID_COLS and 0 <= gy < self.FRAME_GRID_ROWS:
                 self.grid[gx][gy].append(i)
 
-    def set_pose(self, T_cw: SE3) -> None:
+    def set_pose(self, T_cw) :
         self.T_cw = T_cw.copy()
         self.has_pose = True
 
-    def get_camera_center(self) -> np.ndarray:
+    def get_camera_center(self) :
         """返回相机光心在世界坐标系下的位置 O_w = -R_cw^T * t_cw"""
         return -(self.T_cw.R.T @ self.T_cw.t)
 
-    def get_pose_inverse(self) -> SE3:
+    def get_pose_inverse(self) :
         """返回 T_wc (相机到世界变换)"""
         return self.T_cw.inverse()
 
-    def unproject_stereo(self, i: int) -> np.ndarray | None:
+    def unproject_stereo(self, i) :
         """
         将第 i 个具有有效双目深度的特征点反投影到世界坐标系 P_w (3,)
         对应 ORB-SLAM3 Frame::UnprojectStereo(i)
@@ -168,12 +168,12 @@ class Frame:
 
     def get_features_in_area(
         self,
-        x: float,
-        y: float,
-        r: float,
-        min_level: int = -1,
-        max_level: int = -1
-    ) -> list[int]:
+        x,
+        y,
+        r,
+        min_level = -1,
+        max_level = -1
+    ) :
         """
         在以 (x, y) 为中心、半径为 r 的圆形区域内快速检索候选特征点索引
         对应 ORB-SLAM3 Frame::GetFeaturesInArea()
@@ -203,7 +203,7 @@ class Frame:
 
         check_levels = (min_level >= 0) or (max_level >= 0)
         r_sq = r * r
-        indices: list[int] = []
+        indices = []
 
         for ix in range(min_cell_x, max_cell_x + 1):
             for iy in range(min_cell_y, max_cell_y + 1):

@@ -13,7 +13,7 @@ system.py
 - evaluate_ate(gt_positions) -> dict[str, float]
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 import numpy as np
 
 from .core.lie_algebra import SE3
@@ -34,10 +34,12 @@ class SLAMSystem:
 
     def __init__(
         self,
-        camera: StereoCamera,
-        n_features: int = 600,
-        max_local_kfs: int = 8,
-        use_hybrid_optical_flow: bool = True
+        camera,
+        n_features = 600,
+        max_local_kfs = 8,
+        use_hybrid_optical_flow = True,
+        use_hfnet = True,
+        hfnet_root = None,
     ):
         self.camera = camera
         self.slam_map = Map()
@@ -49,25 +51,26 @@ class SLAMSystem:
             local_mapper=self.local_mapper,
             loop_closer=self.loop_closer,
             n_features=n_features,
-            use_hybrid_optical_flow=use_hybrid_optical_flow
+            use_hybrid_optical_flow=use_hybrid_optical_flow,
+            use_hfnet=use_hfnet,
+            hfnet_root=hfnet_root,
         )
         # 记录每帧的 (timestamp, rel_T_cr, ref_kf, is_kf, prev_ref_kf, prior_T_cr) 以在优化后重构全局平滑轨迹
-        self.frame_history: list[tuple] = []
+        self.frame_history = []
 
     def track_monocular(
         self,
-        img_left: np.ndarray,
-        timestamp: float
-    ) -> SE3:
+        img_left,
+        timestamp) :
         """纯单目无 IMU 跟踪接口 (对应 ORB_SLAM3::System::TrackMonocular)"""
         return self.track_monocular_inertial(img_left, timestamp, imu_measurements=None)
 
     def track_monocular_inertial(
         self,
-        img_left: np.ndarray,
-        timestamp: float,
-        imu_measurements: list[ImuMeasurement] | None = None
-    ) -> SE3:
+        img_left,
+        timestamp,
+        imu_measurements = None
+    ) :
         """单目 + IMU 紧耦合跟踪接口 (对应 ORB_SLAM3::System::TrackMonocular with IMU)"""
         prev_ref_kf = self.tracker.ref_kf
         T_cw = self.tracker.grab_image_monocular(img_left, timestamp, imu_measurements)
@@ -83,20 +86,19 @@ class SLAMSystem:
 
     def track_stereo(
         self,
-        img_left: np.ndarray,
-        img_right: np.ndarray,
-        timestamp: float
-    ) -> SE3:
+        img_left,
+        img_right,
+        timestamp) :
         """纯双目跟踪接口 (对应 ORB_SLAM3::System::TrackStereo)"""
         return self.track_stereo_inertial(img_left, img_right, timestamp, imu_measurements=None)
 
     def track_stereo_inertial(
         self,
-        img_left: np.ndarray,
-        img_right: np.ndarray,
-        timestamp: float,
-        imu_measurements: list[ImuMeasurement] | None = None
-    ) -> SE3:
+        img_left,
+        img_right,
+        timestamp,
+        imu_measurements = None
+    ) :
         """双目 + IMU 紧耦合跟踪接口"""
         prev_ref_kf = self.tracker.ref_kf
         T_cw = self.tracker.grab_image_stereo(img_left, img_right, timestamp, imu_measurements)
@@ -112,7 +114,7 @@ class SLAMSystem:
         return T_cw
 
     @staticmethod
-    def _resolve_kf_pose(T_cr: SE3, ref_kf) -> SE3:
+    def _resolve_kf_pose(T_cr, ref_kf) :
         if ref_kf is None:
             return T_cr
         T_rel = T_cr.copy()
@@ -122,14 +124,14 @@ class SLAMSystem:
             curr_ref = curr_ref.parent
         return T_rel * curr_ref.T_cw
 
-    def get_camera_trajectory(self) -> tuple[np.ndarray, list[SE3]]:
+    def get_camera_trajectory(self) :
         """
         根据最新优化后的关键帧位姿与帧间相对位姿恢复全局相机轨迹 T_wc (相机在世界系下的位姿)，
         并在相邻两个关键帧区间 [k_a, k_b] 内将后端 Local BA 的位姿修正量沿 se(3) 流形均匀分摊至中间普通帧，
         消除关键帧触发时的阶跃顿跳现象。
         """
-        poses_wc: list[SE3] = []
-        kf_indices: list[int] = []
+        poses_wc = []
+        kf_indices = []
 
         for idx, item in enumerate(self.frame_history):
             _, T_cr, ref_kf, is_kf, _, _ = item
@@ -155,7 +157,7 @@ class SLAMSystem:
         # 2. 零相位 5 阶李代数流形平滑滤波 (消除帧间高频量化抖动，保证速度微分平滑)
         n_total = len(poses_wc)
         if n_total >= 5:
-            smoothed_wc: list[SE3] = [poses_wc[0], poses_wc[1]]
+            smoothed_wc = [poses_wc[0], poses_wc[1]]
             weights = (-2, -1, 1, 2)
             w_vals = (0.12, 0.23, 0.23, 0.12)
             for k in range(2, n_total - 2):
@@ -171,7 +173,7 @@ class SLAMSystem:
         positions = np.asarray([T_wc.t.copy() for T_wc in poses_wc], dtype=np.float64)
         return positions, poses_wc
 
-    def get_map_points_xyz(self) -> np.ndarray:
+    def get_map_points_xyz(self) :
         """获取当前活跃地图中所有有效 3D 地图点的世界坐标 (M, 3)"""
         mps = self.slam_map.get_all_mappoints()
         if len(mps) == 0:
@@ -179,7 +181,7 @@ class SLAMSystem:
         return np.array([mp.pos_w for mp in mps], dtype=np.float64)
 
     @staticmethod
-    def evaluate_ate(est_positions: np.ndarray, gt_positions: np.ndarray) -> dict[str, float]:
+    def evaluate_ate(est_positions, gt_positions) :
         """
         计算绝对轨迹误差 (Absolute Trajectory Error, ATE - SE(3) Umeyama 对齐与无对齐直接对比)
         双目/双目+IMU 系统具备真实物理尺度 (s = 1.0)，因此同时报告原始尺度误差与刚体对齐 RMSE。

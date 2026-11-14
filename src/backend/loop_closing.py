@@ -19,7 +19,7 @@ backend/loop_closing.py
    消除全局累积漂移！
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 from typing import TYPE_CHECKING
 import numpy as np
 
@@ -35,14 +35,14 @@ if TYPE_CHECKING:
 class LoopClosing:
     __slots__ = ("slam_map", "last_loop_kf_id", "min_kf_gap", "loop_count")
 
-    def __init__(self, slam_map: Map, min_kf_gap: int = 30):
+    def __init__(self, slam_map, min_kf_gap = 30):
         self.slam_map = slam_map
-        self.last_loop_kf_id: int = -100
-        self.min_kf_gap: int = int(min_kf_gap)
-        self.loop_count: int = 0
+        self.last_loop_kf_id = -100
+        self.min_kf_gap = int(min_kf_gap)
+        self.loop_count = 0
 
     @staticmethod
-    def compute_bow_signature(kf: KeyFrame) -> np.ndarray | None:
+    def compute_bow_signature(kf) :
         """
         计算关键帧的 256 维归一化二进制特征分布向量 (用于快速外观相似度检索)
         """
@@ -59,7 +59,7 @@ class LoopClosing:
         kf.bow_vec = hist
         return kf.bow_vec
 
-    def run_for_keyframe(self, curr_kf: KeyFrame) -> bool:
+    def run_for_keyframe(self, curr_kf) :
         """
         对新关键帧执行回环检测与闭合校正
         返回是否成功触发并完成了回环闭合。
@@ -82,7 +82,7 @@ class LoopClosing:
 
         return False
 
-    def detect_loop_candidates(self, curr_kf: KeyFrame) -> list[KeyFrame]:
+    def detect_loop_candidates(self, curr_kf) :
         """检索非局部共视的历史回环候选关键帧"""
         curr_sig = self.compute_bow_signature(curr_kf)
         if curr_sig is None:
@@ -101,7 +101,7 @@ class LoopClosing:
                     min_cov_score = max(0.45, score * 0.85)
 
         curr_pos = curr_kf.get_camera_center()
-        scored_candidates: list[tuple[float, KeyFrame]] = []
+        scored_candidates = []
 
         for kf in self.slam_map.get_all_keyframes():
             if kf in cov_set or kf.is_bad:
@@ -122,9 +122,8 @@ class LoopClosing:
 
     def verify_loop_candidate(
         self,
-        curr_kf: KeyFrame,
-        cand_kf: KeyFrame
-    ) -> tuple[bool, SE3 | None, list[tuple[int, int]]]:
+        curr_kf,
+        cand_kf) :
         """
         对候选回环帧执行 ORB 匹配 + 3D-3D RANSAC SE(3) 求解与内点校验
         """
@@ -137,7 +136,7 @@ class LoopClosing:
             return False, None, []
 
         desc2_mat = cand_kf.descriptors[valid_2]
-        matches: list[tuple[int, int]] = []
+        matches = []
         used_2 = set()
 
         for i1 in valid_1:
@@ -171,8 +170,8 @@ class LoopClosing:
 
         # 3D-3D RANSAC + Kabsch/SVD 求解 T_corr_cw: P_c1 = R_cw * P_w2 + t_cw
         n_m = len(matches)
-        best_inliers: np.ndarray = np.zeros(n_m, dtype=bool)
-        best_T: SE3 | None = None
+        best_inliers = np.zeros(n_m, dtype=bool)
+        best_T = None
         rng = np.random.default_rng(42)
 
         for _ in range(60):
@@ -195,7 +194,7 @@ class LoopClosing:
         return True, refined_T, inlier_pairs
 
     @staticmethod
-    def _solve_kabsch_se3(pts_src: np.ndarray, pts_dst: np.ndarray) -> SE3:
+    def _solve_kabsch_se3(pts_src, pts_dst) :
         """
         使用 SVD (Kabsch / Umeyama 算法) 求解刚体变换 T (R, t) 使得 pts_dst approx R * pts_src + t
         """
@@ -214,11 +213,10 @@ class LoopClosing:
 
     def correct_loop(
         self,
-        curr_kf: KeyFrame,
-        loop_kf: KeyFrame,
-        T_corr_cw: SE3,
-        matched_pairs: list[tuple[int, int]]
-    ) -> None:
+        curr_kf,
+        loop_kf,
+        T_corr_cw,
+        matched_pairs) :
         """
         执行回环闭合:
         1. 融合回环匹配点对的 MapPoint

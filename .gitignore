@@ -1,5 +1,6 @@
 # Ignored reference repositories, datasets, calibration snapshots, and generated outputs
 ORB_SLAM3-master/
+hfnet/
 data/
 outputs/
 calib_images/

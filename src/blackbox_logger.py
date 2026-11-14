@@ -12,7 +12,7 @@ src/blackbox_logger.py
   5. `history_index.jsonl` : 全局历史运行索引表，汇总历次运行核心指标，便于横向对比回顾
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 import csv
 import datetime
 import json
@@ -77,10 +77,10 @@ class BlackboxLogger:
 
     def __init__(
         self,
-        output_dir: str = "outputs",
-        mode: str = "live_mono_imu",
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
+        output_dir = "outputs",
+        mode = "live_mono_imu",
+        metadata = None,
+    ) :
         self.base_dir = os.path.join(output_dir, "blackbox_logs")
         os.makedirs(self.base_dir, exist_ok=True)
 
@@ -108,22 +108,23 @@ class BlackboxLogger:
 
         # 实时累积统计量
         self.frame_count = 0
-        self.prev_ts: float | None = None
-        self.prev_pos: np.ndarray | None = None
-        self.prev_state: str = "NO_IMAGES_YET"
-        self.total_travel_m: float = 0.0
+        self.first_ts = None
+        self.prev_ts = None
+        self.prev_pos = None
+        self.prev_state = "NO_IMAGES_YET"
+        self.total_travel_m = 0.0
 
-        self.pos_history: list[np.ndarray] = []
-        self.step_history: list[float] = []
-        self.gate_history: list[float] = []
-        self.gyro_degs_history: list[float] = []
-        self.flow_px_history: list[float] = []
-        self.derot_px_history: list[float] = []
-        self.fe_ms_history: list[float] = []
-        self.be_ms_history: list[float] = []
-        self.tot_ms_history: list[float] = []
-        self.inliers_history: list[int] = []
-        self.acc_norm_history: list[float] = []
+        self.pos_history = []
+        self.step_history = []
+        self.gate_history = []
+        self.gyro_degs_history = []
+        self.flow_px_history = []
+        self.derot_px_history = []
+        self.fe_ms_history = []
+        self.be_ms_history = []
+        self.tot_ms_history = []
+        self.inliers_history = []
+        self.acc_norm_history = []
 
         self.rot_gated_frames = 0
         self.rot_gated_disp_m = 0.0
@@ -143,7 +144,7 @@ class BlackboxLogger:
         })
 
     @staticmethod
-    def _rot_to_euler_deg(R_wc: np.ndarray) -> tuple[float, float, float]:
+    def _rot_to_euler_deg(R_wc) :
         """将相机光学坐标系旋转矩阵 R_wc (X右, Y下, Z前) 转换为水平机身系 ZYX 姿态角 (Roll, Pitch, Yaw, 与 IMU 严格对齐)"""
         R_bc = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]], dtype=np.float64)
         R = R_bc @ R_wc @ R_bc.T
@@ -158,7 +159,7 @@ class BlackboxLogger:
             yaw = 0.0
         return roll, pitch, yaw
 
-    def log_event(self, event_type: str, payload: dict[str, Any]) -> None:
+    def log_event(self, event_type, payload) :
         if self._events_file.closed:
             return
         record = {
@@ -172,17 +173,19 @@ class BlackboxLogger:
 
     def log_frame(
         self,
-        frame_idx: int,
-        timestamp: float,
-        slam: Any,
-        imu_batch: list[Any] | None = None,
-        imu_status: dict[str, Any] | None = None,
-    ) -> None:
+        frame_idx,
+        timestamp,
+        slam,
+        imu_batch = None,
+        imu_status = None,
+    ) :
         """记录单帧全量状态并立即刷盘"""
         tracker = slam.tracker
         cf = tracker.curr_frame
         state_name = tracker.state.name
 
+        if self.first_ts is None:
+            self.first_ts = float(timestamp)
         dt_s = (timestamp - self.prev_ts) if (self.prev_ts is not None and timestamp > self.prev_ts) else 0.033
         self.prev_ts = float(timestamp)
 
@@ -365,7 +368,7 @@ class BlackboxLogger:
         if self.frame_count % 30 == 0 or self.frame_count == 1:
             self._write_summary_and_report(is_final=False)
 
-    def _build_summary_dict(self, is_final: bool = True) -> dict[str, Any]:
+    def _build_summary_dict(self, is_final = True) :
         pos_arr = np.asarray(self.pos_history, dtype=np.float64) if self.pos_history else np.zeros((1, 3))
         pos_min = pos_arr.min(axis=0).tolist()
         pos_max = pos_arr.max(axis=0).tolist()
@@ -399,7 +402,10 @@ class BlackboxLogger:
             "metadata": self.metadata,
             "stats": {
                 "total_frames": int(self.frame_count),
-                "duration_s": round(float(self.prev_ts or 0.0), 3),
+                "duration_s": round(
+                    float((self.prev_ts - self.first_ts) if (self.prev_ts is not None and self.first_ts is not None) else 0.0),
+                    3,
+                ),
                 "final_state": self.prev_state,
                 "active_keyframes": int(self.last_num_kfs),
                 "active_mappoints": int(self.last_num_mps),
@@ -429,7 +435,7 @@ class BlackboxLogger:
             },
         }
 
-    def _write_summary_and_report(self, is_final: bool = False) -> dict[str, Any]:
+    def _write_summary_and_report(self, is_final = False) :
         summary = self._build_summary_dict(is_final=is_final)
         with open(self.summary_path, mode="w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -481,13 +487,13 @@ class BlackboxLogger:
         shutil.copyfile(self.report_path, os.path.join(self.base_dir, "latest_report.md"))
         return summary
 
-    def finalize(self, artifact_paths: list[str] | None = None) -> str:
+    def finalize(self, artifact_paths = None) :
         """运行结束时归档图表快照、写入最终黑盒报告并追加至全局历史索引"""
         if self._finalized:
             return self.run_dir
         self._finalized = True
 
-        archived_files: list[str] = []
+        archived_files = []
         if artifact_paths:
             for p in artifact_paths:
                 if p and os.path.exists(p):
@@ -539,7 +545,7 @@ class BlackboxLogger:
         return self.run_dir
 
 
-def print_blackbox_history(output_dir: str = "outputs", last_n: int = 10) -> None:
+def print_blackbox_history(output_dir = "outputs", last_n = 10) :
     """在终端打印历史黑盒日志列表与最新一次运行的详细复盘摘要"""
     base_dir = os.path.join(output_dir, "blackbox_logs")
     index_path = os.path.join(base_dir, "history_index.jsonl")

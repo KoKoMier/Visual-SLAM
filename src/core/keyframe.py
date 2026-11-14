@@ -15,7 +15,7 @@ core/keyframe.py
    - 维护回环闭合时新增的强约束边 loop_edges，与生成树及高共视边(>=100)共同构成本质图 (Essential Graph)。
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 from typing import TYPE_CHECKING
 import numpy as np
 
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 
 class KeyFrame:
-    _next_id: int = 0
+    _next_id = 0
 
     __slots__ = (
         "id", "frame_id", "timestamp", "camera",
@@ -46,7 +46,7 @@ class KeyFrame:
         "bow_vec", "feat_vec"
     )
 
-    def __init__(self, frame: Frame):
+    def __init__(self, frame):
         self.id = KeyFrame._next_id
         KeyFrame._next_id += 1
 
@@ -63,13 +63,13 @@ class KeyFrame:
         self.depths = frame.depths.copy()
         self.num_kps = frame.num_kps
 
-        self.map_points: list[MapPoint | None] = list(frame.map_points)
+        self.map_points = list(frame.map_points)
 
-        self.T_cw: SE3 = frame.T_cw.copy()
-        self.v_w: np.ndarray = frame.v_w.copy()
-        self.bg: np.ndarray = frame.bg.copy()
-        self.ba: np.ndarray = frame.ba.copy()
-        self.R_cw_imu_prior: np.ndarray | None = (
+        self.T_cw = frame.T_cw.copy()
+        self.v_w = frame.v_w.copy()
+        self.bg = frame.bg.copy()
+        self.ba = frame.ba.copy()
+        self.R_cw_imu_prior = (
             frame.R_cw_imu_prior.copy() if frame.R_cw_imu_prior is not None else None
         )
 
@@ -83,51 +83,51 @@ class KeyFrame:
         self.grid = [[ list(cell) for cell in col ] for col in frame.grid]
 
         # 共视图、生成树与本质图拓扑连接
-        self.connected_kf_weights: dict[KeyFrame, int] = {}
-        self.ordered_connected_kfs: list[KeyFrame] = []
-        self.ordered_weights: list[int] = []
+        self.connected_kf_weights = {}
+        self.ordered_connected_kfs = []
+        self.ordered_weights = []
 
-        self.first_connection: bool = True
-        self.parent: KeyFrame | None = None
-        self.children: set[KeyFrame] = set()
-        self.loop_edges: set[KeyFrame] = set()
+        self.first_connection = True
+        self.parent = None
+        self.children = set()
+        self.loop_edges = set()
 
-        self.not_erase: bool = False
-        self.to_be_erased: bool = False
-        self.is_bad: bool = False
-        self.T_cp: SE3 = SE3.identity()
+        self.not_erase = False
+        self.to_be_erased = False
+        self.is_bad = False
+        self.T_cp = SE3.identity()
 
         # 词袋/全局描述子缓存 (用于快速回环检索)
-        self.bow_vec: np.ndarray | None = None
-        self.feat_vec: dict[int, list[int]] | None = None
+        self.bow_vec = None
+        self.feat_vec = None
 
-    def set_pose(self, T_cw: SE3) -> None:
+    def set_pose(self, T_cw) :
         self.T_cw = T_cw.copy()
 
-    def get_pose(self) -> SE3:
+    def get_pose(self) :
         return self.T_cw
 
-    def get_pose_inverse(self) -> SE3:
+    def get_pose_inverse(self) :
         return self.T_cw.inverse()
 
-    def get_camera_center(self) -> np.ndarray:
+    def get_camera_center(self) :
         return -(self.T_cw.R.T @ self.T_cw.t)
 
-    def add_mappoint(self, mp: MapPoint, idx: int) -> None:
+    def add_mappoint(self, mp, idx) :
         self.map_points[idx] = mp
 
-    def erase_mappoint_match(self, idx: int) -> None:
+    def erase_mappoint_match(self, idx) :
         if 0 <= idx < self.num_kps:
             self.map_points[idx] = None
 
-    def replace_mappoint_match(self, idx: int, mp: MapPoint) -> None:
+    def replace_mappoint_match(self, idx, mp) :
         if 0 <= idx < self.num_kps:
             self.map_points[idx] = mp
 
-    def get_mappoint_matches(self) -> list[MapPoint | None]:
+    def get_mappoint_matches(self) :
         return self.map_points
 
-    def tracked_mappoints(self, min_obs: int = 1) -> int:
+    def tracked_mappoints(self, min_obs = 1) :
         """统计当前关键帧中观测次数 >= min_obs 的有效地图点数量"""
         count = 0
         for mp in self.map_points:
@@ -138,12 +138,12 @@ class KeyFrame:
 
     def get_features_in_area(
         self,
-        x: float,
-        y: float,
-        r: float,
-        min_level: int = -1,
-        max_level: int = -1
-    ) -> list[int]:
+        x,
+        y,
+        r,
+        min_level = -1,
+        max_level = -1
+    ) :
         """与 Frame.get_features_in_area 完全一致的 64x48 网格空间查找"""
         if r <= 0.0 or self.num_kps == 0:
             return []
@@ -165,7 +165,7 @@ class KeyFrame:
 
         check_levels = (min_level >= 0) or (max_level >= 0)
         r_sq = r * r
-        indices: list[int] = []
+        indices = []
         for ix in range(min_cell_x, max_cell_x + 1):
             for iy in range(min_cell_y, max_cell_y + 1):
                 for idx in self.grid[ix][iy]:
@@ -181,7 +181,7 @@ class KeyFrame:
                         indices.append(idx)
         return indices
 
-    def unproject_stereo(self, i: int) -> np.ndarray | None:
+    def unproject_stereo(self, i) :
         z = float(self.depths[i])
         if z <= 0.0:
             return None
@@ -189,7 +189,7 @@ class KeyFrame:
         p_c = self.camera.unproject_depth(u, v, z)
         return self.T_cw.inverse().transform(p_c)
 
-    def compute_scene_median_depth(self, q: int = 2) -> float:
+    def compute_scene_median_depth(self, q = 2) :
         """
         对应 ORB-SLAM3 KeyFrame::ComputeSceneMedianDepth(q):
         计算该关键帧所有有效地图点在相机坐标系下 Z 轴深度的中位数 (q=2) 或均值 (q=1)。
@@ -213,29 +213,29 @@ class KeyFrame:
     # =========================================================================
     # 共视图 (Covisibility Graph) 与生成树 (Spanning Tree) 核心维护方法
     # =========================================================================
-    def add_connection(self, kf: KeyFrame, weight: int) -> None:
+    def add_connection(self, kf, weight) :
         self.connected_kf_weights[kf] = int(weight)
         self.update_best_covisibles()
 
-    def erase_connection(self, kf: KeyFrame) -> None:
+    def erase_connection(self, kf) :
         if kf in self.connected_kf_weights:
             del self.connected_kf_weights[kf]
             self.update_best_covisibles()
 
-    def update_best_covisibles(self) -> None:
+    def update_best_covisibles(self) :
         """按共视地图点权重降序排列相连关键帧 (权重相同时按 id 降序保证严格确定性)"""
         valid_items = [(kf, w) for kf, w in self.connected_kf_weights.items() if not kf.is_bad]
         valid_items.sort(key=lambda item: (item[1], item[0].id), reverse=True)
         self.ordered_connected_kfs = [item[0] for item in valid_items]
         self.ordered_weights = [item[1] for item in valid_items]
 
-    def update_connections(self) -> None:
+    def update_connections(self) :
         """
         更新当前关键帧在共视图中的边与生成树父节点
         对应 ORB-SLAM3 KeyFrame::UpdateConnections()
         阈值 th = 15 (共视点 >= 15 建立共视边；若均 < 15 则连接共视最多的那一帧)
         """
-        kf_counter: dict[KeyFrame, int] = {}
+        kf_counter = {}
         for mp in self.map_points:
             if mp is None or mp.is_bad:
                 continue
@@ -249,7 +249,7 @@ class KeyFrame:
 
         th = 15
         max_weight = 0
-        best_kf: KeyFrame | None = None
+        best_kf = None
 
         self.connected_kf_weights.clear()
         for kf, weight in kf_counter.items():
@@ -271,25 +271,25 @@ class KeyFrame:
             self.parent.add_child(self)
             self.first_connection = False
 
-    def get_connected_keyframes(self) -> list[KeyFrame]:
+    def get_connected_keyframes(self) :
         return self.ordered_connected_kfs
 
-    def get_best_covisibility_keyframes(self, n: int) -> list[KeyFrame]:
+    def get_best_covisibility_keyframes(self, n) :
         return self.ordered_connected_kfs[:n]
 
-    def get_covisibles_by_weight(self, w: int) -> list[KeyFrame]:
+    def get_covisibles_by_weight(self, w) :
         return [kf for kf, weight in zip(self.ordered_connected_kfs, self.ordered_weights) if weight >= w]
 
-    def get_weight(self, kf: KeyFrame) -> int:
+    def get_weight(self, kf) :
         return self.connected_kf_weights.get(kf, 0)
 
-    def add_child(self, kf: KeyFrame) -> None:
+    def add_child(self, kf) :
         self.children.add(kf)
 
-    def erase_child(self, kf: KeyFrame) -> None:
+    def erase_child(self, kf) :
         self.children.discard(kf)
 
-    def change_parent(self, new_parent: KeyFrame) -> None:
+    def change_parent(self, new_parent) :
         if new_parent.id == self.id:
             return
         if self.parent is not None:
@@ -297,11 +297,11 @@ class KeyFrame:
         self.parent = new_parent
         new_parent.add_child(self)
 
-    def add_loop_edge(self, kf: KeyFrame) -> None:
+    def add_loop_edge(self, kf) :
         self.not_erase = True
         self.loop_edges.add(kf)
 
-    def set_bad_flag(self, slam_map: Map | None = None) -> None:
+    def set_bad_flag(self, slam_map = None) :
         """
         冗余关键帧安全剔除 (对应 ORB-SLAM3 KeyFrame::SetBadFlag):
         1. 若是第 0 帧或正在参与回环边约束，禁止剔除。

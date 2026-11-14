@@ -18,25 +18,46 @@ calibrate_stereo_camera.py
    `python calibrate_stereo_camera.py --verify_sim`
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 import argparse
 import glob
 import json
 import os
+import sys
 import time
+
+_conda_lib_bin = os.path.join(sys.prefix, "Library", "bin")
+if os.path.isdir(_conda_lib_bin) and _conda_lib_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _conda_lib_bin + os.pathsep + os.environ.get("PATH", "")
+
 import cv2
 import numpy as np
 
+
+def _imwrite_safe(path, img):
+    ext = os.path.splitext(path)[1] or ".png"
+    ok, buf = cv2.imencode(ext, img)
+    if ok:
+        buf.tofile(path)
+        return True
+    return False
+
+
+def _imread_gray_safe(path):
+    raw = np.fromfile(path, dtype=np.uint8)
+    return cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+
+
 from src.core.lie_algebra import SE3, exp_so3, log_so3, skew
 from src.core.camera import StereoCamera
-from src.dataset import WitMotionSerialIMU, find_stereo_camera_id
+from src.dataset import WitMotionSerialIMU, find_stereo_camera_id, open_camera_capture
 
 
 # ============================================================================
 # 1. 数学与手眼标定核心求解器 (SO(3) Hand-Eye SVD + 流形高斯牛顿精化 + 杆臂求解)
 # ============================================================================
 
-def euler_deg_to_rotmat(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+def euler_deg_to_rotmat(roll_deg, pitch_deg, yaw_deg) :
     """将维特智能 IMU 输出的欧拉角 (Roll, Pitch, Yaw, 单位: deg, Z-Y-X 顺序) 转换为旋转矩阵 R_wb"""
     r = np.deg2rad(roll_deg)
     p = np.deg2rad(pitch_deg)
@@ -51,7 +72,7 @@ def euler_deg_to_rotmat(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np
     return Rz @ Ry @ Rx
 
 
-def project_to_so3(M: np.ndarray) -> np.ndarray:
+def project_to_so3(M) :
     """通过 SVD 将任意 3x3 矩阵正交化投影至特殊正交群 SO(3)"""
     U, _, Vt = np.linalg.svd(M)
     R = U @ Vt
@@ -62,14 +83,14 @@ def project_to_so3(M: np.ndarray) -> np.ndarray:
 
 
 def calibrate_camera_imu_extrinsics(
-    R_wc_list: list[np.ndarray],
-    t_wc_list: list[np.ndarray],
-    R_wb_list: list[np.ndarray],
-    acc_b_list: list[np.ndarray],
-    gyro_b_list: list[np.ndarray] | None = None,
-    timestamps: list[float] | None = None,
-    t_bc_prior: np.ndarray | None = None,
-) -> dict:
+    R_wc_list,
+    t_wc_list,
+    R_wb_list,
+    acc_b_list,
+    gyro_b_list = None,
+    timestamps = None,
+    t_bc_prior = None,
+) :
     """
     联合标定左目相机 C0 到 IMU Body 系的外参矩阵 T_b_c0 = [R_bc | t_bc]:
     1. 闭式初值求解 (Closed-form Kabsch / Tsai-Lenz on SO(3)):
@@ -106,10 +127,10 @@ def calibrate_camera_imu_extrinsics(
         }
 
     # --- Step 1: 构造所有有效姿态对 (i, j) 的相对旋转对 (A_ij, B_ij) ---
-    pairs_A: list[np.ndarray] = []
-    pairs_B: list[np.ndarray] = []
-    alpha_vecs: list[np.ndarray] = []
-    beta_vecs: list[np.ndarray] = []
+    pairs_A = []
+    pairs_B = []
+    alpha_vecs = []
+    beta_vecs = []
 
     for i in range(n_poses):
         for j in range(i + 1, n_poses):
@@ -183,14 +204,14 @@ def calibrate_camera_imu_extrinsics(
         g_w_sum += R_wc_list[k] @ (R_bc.T @ acc_arr[k])
     g_w = (g_w_sum / max(1e-9, float(np.linalg.norm(g_w_sum)))) * g_mag
 
-    rot_err_deg_list: list[float] = []
+    rot_err_deg_list = []
     for A_ij, B_ij in zip(pairs_A, pairs_B):
         r_rot = log_so3(R_bc.T @ A_ij.T @ R_bc @ B_ij)
         rot_err_deg_list.append(float(np.rad2deg(np.linalg.norm(r_rot))))
     if not rot_err_deg_list:
         rot_err_deg_list = [0.0]
 
-    grav_errs: list[float] = []
+    grav_errs = []
     for k in range(n_poses):
         r_g = acc_arr[k] - R_bc @ (R_wc_list[k].T @ g_w)
         grav_errs.append(float(np.linalg.norm(r_g)))
@@ -242,11 +263,11 @@ def calibrate_camera_imu_extrinsics(
 # ============================================================================
 
 def generate_checkerboard_image(
-    cols: int = 9,
-    rows: int = 6,
-    square_px: int = 120,
-    out_path: str = "outputs/checkerboard_9x6.png"
-) -> None:
+    cols = 9,
+    rows = 6,
+    square_px = 120,
+    out_path = "outputs/checkerboard_9x6.png"
+) :
     """生成 (cols x rows) 内角点的黑白棋盘格高清图像 (即 (cols+1) x (rows+1) 个方格)"""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     n_sq_x = cols + 1
@@ -263,21 +284,21 @@ def generate_checkerboard_image(
                 x0 = margin + c * square_px
                 board[y0 : y0 + square_px, x0 : x0 + square_px] = 0
 
-    cv2.imwrite(out_path, board)
+    _imwrite_safe(out_path, board)
     print(f"[标定板已生成] 路径: {os.path.abspath(out_path)} (内角点: {cols}x{rows})")
     print("  提示: 可按 100% 比例打印在硬质平板 A4 纸上，或直接全屏显示在副屏/iPad 上，并用尺子实测单个黑格边长 (毫米)。")
 
 
 def capture_stereo_imu_pairs(
-    cam_id: int = -1,
-    concat_width: int = 1280,
-    height: int = 480,
-    imu_port: str = "COM3",
-    imu_baud: int = 9600,
-    cols: int = 9,
-    rows: int = 6,
-    save_dir: str = "data/calib_images"
-) -> None:
+    cam_id = -1,
+    concat_width = 1280,
+    height = 480,
+    imu_port = "COM3",
+    imu_baud = 9600,
+    cols = 9,
+    rows = 6,
+    save_dir = "data/calib_images"
+) :
     """
     同时打开 USB 同步左右拼接双目摄像头与串口 IMU:
     - 实时检测左/右目棋盘格角点并显示实时 IMU 姿态与加速度
@@ -295,7 +316,7 @@ def capture_stereo_imu_pairs(
     imu = WitMotionSerialIMU(port=imu_port, baud=imu_baud)
     imu_ok = imu.start()
 
-    cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+    cap = open_camera_capture(cam_id)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, concat_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
@@ -303,7 +324,7 @@ def capture_stereo_imu_pairs(
     half_w = concat_width // 2
     pattern_size = (cols, rows)
 
-    imu_samples: list[dict] = []
+    imu_samples = []
     if os.path.exists(imu_json_path):
         try:
             with open(imu_json_path, "r", encoding="utf-8") as f:
@@ -367,8 +388,8 @@ def capture_stereo_imu_pairs(
             elif key in (ord(" "), ord("s"), ord("S")):
                 if ok_l and ok_r:
                     idx_str = f"{saved_count:03d}.png"
-                    cv2.imwrite(os.path.join(left_dir, idx_str), img_l)
-                    cv2.imwrite(os.path.join(right_dir, idx_str), img_r)
+                    _imwrite_safe(os.path.join(left_dir, idx_str), img_l)
+                    _imwrite_safe(os.path.join(right_dir, idx_str), img_r)
                     sample_entry = {
                         "image_name": idx_str,
                         "timestamp": float(time.perf_counter() - t0),
@@ -399,17 +420,17 @@ def capture_stereo_imu_pairs(
 # ============================================================================
 
 def _save_calibration_report_plot(
-    per_view_err_l: list[float],
-    per_view_err_r: list[float],
-    baseline_m: float,
-    R_r_l: np.ndarray,
-    t_r_l: np.ndarray,
-    T_b_c1: np.ndarray,
-    imu_extrinsic_res: dict,
-    acc_samples: np.ndarray,
-    R_wc_list: list[np.ndarray],
-    out_path: str,
-) -> None:
+    per_view_err_l,
+    per_view_err_r,
+    baseline_m,
+    R_r_l,
+    t_r_l,
+    T_b_c1,
+    imu_extrinsic_res,
+    acc_samples,
+    R_wc_list,
+    out_path,
+) :
     """生成四合一【双目内参重投影误差 + 3D 传感器外参坐标架 + 重力方向对齐 + 手眼旋转误差】可视化报告"""
     try:
         import matplotlib
@@ -437,7 +458,7 @@ def _save_calibration_report_plot(
     ax2 = fig.add_subplot(2, 2, 2, projection="3d")
     axis_len = max(0.025, baseline_m * 0.40)
 
-    def _draw_frame(ax, R_frame: np.ndarray, t_frame: np.ndarray, name: str):
+    def _draw_frame(ax, R_frame, t_frame, name):
         colors = ("#e53935", "#43a047", "#1e88e5")
         for axis_i, col in enumerate(colors):
             vec = R_frame[:, axis_i] * axis_len
@@ -511,14 +532,14 @@ def _save_calibration_report_plot(
 
 
 def calibrate_stereo_from_folder(
-    save_dir: str = "data/calib_images",
-    cols: int = 9,
-    rows: int = 6,
-    square_mm: float = 25.0,
-    out_json: str = "config/custom_stereo_imu.json",
-    out_check_png: str = "outputs/stereo_rectification_check.png",
-    out_report_png: str = "outputs/camera_imu_calibration_report.png",
-) -> dict:
+    save_dir = "data/calib_images",
+    cols = 9,
+    rows = 6,
+    square_mm = 25.0,
+    out_json = "config/custom_stereo_imu.json",
+    out_check_png = "outputs/stereo_rectification_check.png",
+    out_report_png = "outputs/camera_imu_calibration_report.png",
+) :
     """
     读取 data/calib_images/left, right 与 imu_calib_samples.json，完整执行：
     1. 左、右单目独立内参与畸变系数标定 (K_l, D_l, K_r, D_r)
@@ -534,7 +555,7 @@ def calibrate_stereo_from_folder(
         )
 
     imu_json_path = os.path.join(save_dir, "imu_calib_samples.json")
-    imu_map: dict[str, dict] = {}
+    imu_map = {}
     if os.path.exists(imu_json_path):
         with open(imu_json_path, "r", encoding="utf-8") as f:
             for item in json.load(f):
@@ -549,15 +570,15 @@ def calibrate_stereo_from_folder(
     obj_points = []
     img_points_l = []
     img_points_r = []
-    matched_imu_records: list[dict] = []
+    matched_imu_records = []
     img_size = None
-    sample_pair: tuple[np.ndarray, np.ndarray] | None = None
+    sample_pair = None
 
     subpix_criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
 
     for lf, rf in zip(left_files, right_files):
-        im_l = cv2.imread(lf, cv2.IMREAD_GRAYSCALE)
-        im_r = cv2.imread(rf, cv2.IMREAD_GRAYSCALE)
+        im_l = _imread_gray_safe(lf)
+        im_r = _imread_gray_safe(rf)
         if im_l is None or im_r is None:
             continue
         if img_size is None:
@@ -589,8 +610,8 @@ def calibrate_stereo_from_folder(
     err_l, K_l, D_l, rvecs_l, tvecs_l = cv2.calibrateCamera(obj_points, img_points_l, img_size, None, None)
     err_r, K_r, D_r, rvecs_r, tvecs_r = cv2.calibrateCamera(obj_points, img_points_r, img_size, None, None)
 
-    per_view_err_l: list[float] = []
-    per_view_err_r: list[float] = []
+    per_view_err_l = []
+    per_view_err_r = []
     for i in range(n_valid):
         proj_l, _ = cv2.projectPoints(obj_points[i], rvecs_l[i], tvecs_l[i], K_l, D_l)
         proj_r, _ = cv2.projectPoints(obj_points[i], rvecs_r[i], tvecs_r[i], K_r, D_r)
@@ -622,8 +643,8 @@ def calibrate_stereo_from_folder(
     print("[Step 2/3] 左目相机与 IMU 手眼外参 (T_b_c1) 及零偏联合标定")
     print("=" * 74)
 
-    R_wc_list: list[np.ndarray] = []
-    t_wc_list: list[np.ndarray] = []
+    R_wc_list = []
+    t_wc_list = []
     for rv, tv in zip(rvecs_l, tvecs_l):
         R_cw, _ = cv2.Rodrigues(rv)
         t_cw = tv.ravel().astype(np.float64)
@@ -715,7 +736,7 @@ def calibrate_stereo_from_folder(
         for y in range(20, canvas.shape[0], 28):
             cv2.line(canvas, (0, y), (canvas.shape[1], y), (0, 255, 0), 1, cv2.LINE_AA)
         os.makedirs(os.path.dirname(out_check_png), exist_ok=True)
-        cv2.imwrite(out_check_png, canvas)
+        _imwrite_safe(out_check_png, canvas)
         print(f"[极线对齐检验图已保存] -> {os.path.abspath(out_check_png)}")
 
     _save_calibration_report_plot(
@@ -738,18 +759,18 @@ def calibrate_stereo_from_folder(
 # ============================================================================
 
 def calibrate_live_stereo_and_imu(
-    cam_id: int = -1,
-    concat_width: int = 1280,
-    height: int = 480,
-    imu_port: str = "COM3",
-    imu_baud: int = 9600,
-    num_frames: int = 60,
-    baseline_mm: float = 60.0,
-    show_gui: bool = False,
-    out_json: str = "config/custom_stereo_imu.json",
-    out_check_png: str = "outputs/live_stereo_rectification_check.png",
-    out_report_png: str = "outputs/live_camera_imu_calibration_report.png",
-) -> dict:
+    cam_id = -1,
+    concat_width = 1280,
+    height = 480,
+    imu_port = "COM3",
+    imu_baud = 9600,
+    num_frames = 60,
+    baseline_mm = 60.0,
+    show_gui = False,
+    out_json = "config/custom_stereo_imu.json",
+    out_check_png = "outputs/live_stereo_rectification_check.png",
+    out_report_png = "outputs/live_camera_imu_calibration_report.png",
+) :
     """
     连接当前插入的 USB 双目摄像头 + 串口 IMU 执行【方式 B】两阶段在线快速标定:
     - 阶段 1 (前 40% 帧, 静置标定): 保持双目+IMU 水平静止，标定陀螺仪静态零偏 bg、重力模长与左右目垂直极线偏差 dy；
@@ -766,7 +787,7 @@ def calibrate_live_stereo_and_imu(
     imu = WitMotionSerialIMU(port=imu_port, baud=imu_baud)
     imu_ok = imu.start()
 
-    cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+    cap = open_camera_capture(cam_id)
     if not cap.isOpened():
         imu.close()
         raise RuntimeError(f"无法打开双目摄像头 cam_id={cam_id}")
@@ -959,7 +980,7 @@ def calibrate_live_stereo_and_imu(
         for y in range(20, canvas.shape[0], 28):
             cv2.line(canvas, (0, y), (canvas.shape[1], y), (0, 255, 0), 1, cv2.LINE_AA)
         os.makedirs(os.path.dirname(out_check_png), exist_ok=True)
-        cv2.imwrite(out_check_png, canvas)
+        _imwrite_safe(out_check_png, canvas)
         print(f"[极线对齐检验图已保存] -> {os.path.abspath(out_check_png)}")
 
     per_l = [0.15 + 0.04 * abs(np.sin(i)) for i in range(len(acc_samples))]
@@ -984,11 +1005,11 @@ def calibrate_live_stereo_and_imu(
 # ============================================================================
 
 def verify_calibration_pipeline_with_synthetic_data(
-    save_dir: str = "data/calib_images",
-    cols: int = 9,
-    rows: int = 6,
-    square_mm: float = 25.0,
-) -> None:
+    save_dir = "data/calib_images",
+    cols = 9,
+    rows = 6,
+    square_mm = 25.0,
+) :
     """
     生成 16 组具有已知真实内参 (K_l, D_l, K_r, D_r)、真实双目外参 (R_r_l, t_r_l) 与
     真实相机-IMU 外参 (R_b_c1_gt, t_b_c1_gt) 的合成双目棋盘格图像与同步 IMU 数据，
@@ -1073,7 +1094,7 @@ def verify_calibration_pipeline_with_synthetic_data(
             pts_norm_undist = cv2.undistortPoints(pts_dist, K_mat, D_vec, P=K_mat).reshape(height, width, 2)
             img_dist = cv2.remap(img_undist, pts_norm_undist[:, :, 0], pts_norm_undist[:, :, 1], cv2.INTER_LINEAR, borderValue=185)
             img_dist = cv2.GaussianBlur(img_dist, (3, 3), 0.5)
-            cv2.imwrite(os.path.join(side_dir, f"{idx:03d}.png"), img_dist)
+            _imwrite_safe(os.path.join(side_dir, f"{idx:03d}.png"), img_dist)
 
         # 生成对应姿态的真实 IMU 姿态与比力测量 (含传感器微噪声)
         R_wc = R_cw.T

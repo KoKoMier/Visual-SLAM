@@ -13,7 +13,7 @@ core/mappoint.py
 5. 跟踪可见性统计 (visible_count / found_count) 用于局部建图剔除劣质点。
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 from typing import TYPE_CHECKING
 import numpy as np
 import cv2
@@ -27,24 +27,24 @@ _POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(256)], dtype=np.int32
 
 
 class MapPoint:
-    _next_id: int = 0
+    _next_id = 0
 
     __slots__ = (
         "id", "pos_w", "normal", "descriptor",
         "ref_kf", "first_kf_id", "first_frame_id",
         "observations", "visible_count", "found_count",
         "min_distance", "max_distance",
-        "is_bad", "replaced_by", "track_proj_x", "track_proj_y",
+        "is_bad", "is_temp_flow_point", "replaced_by", "track_proj_x", "track_proj_y",
         "track_proj_xr", "track_in_view", "track_scale_level",
         "track_view_cos", "last_frame_seen"
     )
 
     def __init__(
         self,
-        pos_w: np.ndarray,
-        ref_kf: KeyFrame | None = None,
-        first_frame_id: int = -1,
-        descriptor: np.ndarray | None = None
+        pos_w,
+        ref_kf = None,
+        first_frame_id = -1,
+        descriptor = None
     ):
         self.id = MapPoint._next_id
         MapPoint._next_id += 1
@@ -53,40 +53,41 @@ class MapPoint:
         self.normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
         self.descriptor = descriptor.copy() if descriptor is not None else None
 
-        self.ref_kf: KeyFrame | None = ref_kf
-        self.first_kf_id: int = ref_kf.id if ref_kf is not None else -1
-        self.first_frame_id: int = int(first_frame_id)
+        self.ref_kf = ref_kf
+        self.first_kf_id = ref_kf.id if ref_kf is not None else -1
+        self.first_frame_id = int(first_frame_id)
 
         # 观测字典: KeyFrame -> 特征点索引 idx
-        self.observations: dict[KeyFrame, int] = {}
-        self.visible_count: int = 1
-        self.found_count: int = 1
+        self.observations = {}
+        self.visible_count = 1
+        self.found_count = 1
 
-        self.min_distance: float = 0.0
-        self.max_distance: float = float("inf")
+        self.min_distance = 0.0
+        self.max_distance = float("inf")
 
-        self.is_bad: bool = False
-        self.replaced_by: MapPoint | None = None
+        self.is_bad = False
+        self.is_temp_flow_point = False
+        self.replaced_by = None
 
         # 前端局部地图投影缓存变量 (对应 ORB-SLAM3 mTrackProjX 等)
-        self.track_proj_x: float = 0.0
-        self.track_proj_y: float = 0.0
-        self.track_proj_xr: float = 0.0
-        self.track_in_view: bool = False
-        self.track_scale_level: int = 0
-        self.track_view_cos: float = 1.0
-        self.last_frame_seen: int = -1
+        self.track_proj_x = 0.0
+        self.track_proj_y = 0.0
+        self.track_proj_xr = 0.0
+        self.track_in_view = False
+        self.track_scale_level = 0
+        self.track_view_cos = 1.0
+        self.last_frame_seen = -1
 
-    def set_world_pos(self, pos_w: np.ndarray) -> None:
+    def set_world_pos(self, pos_w) :
         self.pos_w = np.asarray(pos_w, dtype=np.float64).reshape(3).copy()
 
-    def get_world_pos(self) -> np.ndarray:
+    def get_world_pos(self) :
         return self.pos_w
 
-    def num_observations(self) -> int:
+    def num_observations(self) :
         return len(self.observations)
 
-    def add_observation(self, kf: KeyFrame, idx: int) -> None:
+    def add_observation(self, kf, idx) :
         """记录关键帧 kf 的第 idx 个特征点观测到了本 MapPoint"""
         if self.is_bad:
             return
@@ -95,7 +96,7 @@ class MapPoint:
             if self.ref_kf is None:
                 self.ref_kf = kf
 
-    def erase_observation(self, kf: KeyFrame, slam_map: Map | None = None) -> None:
+    def erase_observation(self, kf, slam_map = None) :
         """移除关键帧观测；若有效观测少于 2 个关键帧且非刚生成的双目点，标记为 bad"""
         if kf in self.observations:
             del self.observations[kf]
@@ -104,7 +105,7 @@ class MapPoint:
             if len(self.observations) <= 1:
                 self.set_bad_flag(slam_map)
 
-    def set_bad_flag(self, slam_map: Map | None = None) -> None:
+    def set_bad_flag(self, slam_map = None) :
         """销毁劣质地图点并通知所有观测关键帧清除引用"""
         self.is_bad = True
         obs_copy = list(self.observations.items())
@@ -114,7 +115,7 @@ class MapPoint:
         if slam_map is not None:
             slam_map.erase_mappoint(self)
 
-    def replace(self, other: MapPoint, slam_map: Map | None = None) -> None:
+    def replace(self, other, slam_map = None) :
         """在局部建图或回环融合时，将当前点合并到 other 地图点"""
         if other.id == self.id:
             return
@@ -136,7 +137,7 @@ class MapPoint:
         if slam_map is not None:
             slam_map.erase_mappoint(self)
 
-    def get_replaced(self) -> MapPoint | None:
+    def get_replaced(self) :
         """
         对应 ORB-SLAM3 MapPoint::GetReplaced():
         返回当前地图点被融合替换后的最终目标 MapPoint（支持传递替换链解析）。
@@ -146,24 +147,24 @@ class MapPoint:
             mp = mp.replaced_by
         return mp
 
-    def is_in_keyframe(self, kf: KeyFrame) -> bool:
+    def is_in_keyframe(self, kf) :
         return kf in self.observations
 
-    def get_index_in_keyframe(self, kf: KeyFrame) -> int:
+    def get_index_in_keyframe(self, kf) :
         return self.observations.get(kf, -1)
 
-    def increase_visible(self, n: int = 1) -> None:
+    def increase_visible(self, n = 1) :
         self.visible_count += int(n)
 
-    def increase_found(self, n: int = 1) -> None:
+    def increase_found(self, n = 1) :
         self.found_count += int(n)
 
-    def get_found_ratio(self) -> float:
+    def get_found_ratio(self) :
         if self.visible_count == 0:
             return 0.0
         return float(self.found_count) / float(self.visible_count)
 
-    def compute_distinctive_descriptors(self) -> None:
+    def compute_distinctive_descriptors(self) :
         """
         计算最具代表性的 ORB 描述子 (对应 ORB-SLAM3 MapPoint::ComputeDistinctiveDescriptors):
         收集所有观测关键帧中对应的 256-bit ORB 描述子，计算两两汉明距离矩阵，
@@ -192,7 +193,7 @@ class MapPoint:
         best_idx = int(np.argmin(median_dists))
         self.descriptor = desc_mat[best_idx].copy()
 
-    def update_normal_and_depth(self) -> None:
+    def update_normal_and_depth(self) :
         """
         更新地图点平均观测方向向量 normal 与金字塔尺度距离范围
         对应 ORB-SLAM3 MapPoint::UpdateNormalAndDepth()
@@ -225,7 +226,7 @@ class MapPoint:
         self.max_distance = dist * scale_factor
         self.min_distance = self.max_distance / max_scale
 
-    def predict_scale(self, current_dist: float, n_levels: int = 8, log_scale_factor: float = np.log(1.2)) -> int:
+    def predict_scale(self, current_dist, n_levels = 8, log_scale_factor = np.log(1.2)) :
         """根据当前距离预测特征点在图像金字塔中的最佳层级 (0 ~ n_levels-1)"""
         if current_dist <= 1e-6 or self.max_distance <= 1e-6:
             return 0

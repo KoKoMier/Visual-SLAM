@@ -15,7 +15,7 @@ frontend/imu_preintegration.py
    无需重新积分原始高频 IMU 数据！
 """
 
-from __future__ import annotations
+# Python 3.6 compatible
 from dataclasses import dataclass
 import numpy as np
 
@@ -44,10 +44,10 @@ class ImuPreintegrator:
 
     def __init__(
         self,
-        bg: np.ndarray | None = None,
-        ba: np.ndarray | None = None,
-        gyro_noise_sigma: float = 1.6968e-4,
-        acc_noise_sigma: float = 2.0000e-3
+        bg = None,
+        ba = None,
+        gyro_noise_sigma = 1.6968e-4,
+        acc_noise_sigma = 2.0000e-3
     ):
         self.bg = np.zeros(3, dtype=np.float64) if bg is None else np.asarray(bg, dtype=np.float64).reshape(3).copy()
         self.ba = np.zeros(3, dtype=np.float64) if ba is None else np.asarray(ba, dtype=np.float64).reshape(3).copy()
@@ -60,7 +60,7 @@ class ImuPreintegrator:
         self.dR = np.eye(3, dtype=np.float64)
         self.dv = np.zeros(3, dtype=np.float64)
         self.dp = np.zeros(3, dtype=np.float64)
-        self.dt_total: float = 0.0
+        self.dt_total = 0.0
 
         # 对零偏的一阶解析雅可比矩阵 (3x3)
         self.J_R_bg = np.zeros((3, 3), dtype=np.float64)
@@ -71,9 +71,9 @@ class ImuPreintegrator:
 
         # 9x9 预积分误差协方差矩阵 [delta_theta (3), delta_v (3), delta_p (3)]
         self.cov = np.zeros((9, 9), dtype=np.float64)
-        self.measurements: list[ tuple[np.ndarray, np.ndarray, float] ] = []
+        self.measurements = []
 
-    def reset(self, bg: np.ndarray | None = None, ba: np.ndarray | None = None) -> None:
+    def reset(self, bg = None, ba = None) :
         if bg is not None:
             self.bg = np.asarray(bg, dtype=np.float64).reshape(3).copy()
         if ba is not None:
@@ -92,7 +92,7 @@ class ImuPreintegrator:
         self.cov.fill(0.0)
         self.measurements.clear()
 
-    def integrate_new_measurement(self, acc: np.ndarray, gyro: np.ndarray, dt: float) -> None:
+    def integrate_new_measurement(self, acc, gyro, dt) :
         """
         单步预积分递推 (对应 ORB-SLAM3 Preintegrated::IntegrateNewMeasurement)
         """
@@ -149,16 +149,16 @@ class ImuPreintegrator:
         self.dR = self.dR @ dR_step
         self.dt_total += dt
 
-    def get_updated_delta_rotation(self, bg_new: np.ndarray | None = None) -> np.ndarray:
+    def get_updated_delta_rotation(self, bg_new = None) :
         """零偏变化后的一阶修正旋转: dR_updated = dR * Exp(J_R_bg * delta_bg)"""
         dbg = self.d_bg if bg_new is None else (np.asarray(bg_new, dtype=np.float64).reshape(3) - self.bg)
         return self.dR @ exp_so3(self.J_R_bg @ dbg)
 
     def get_updated_delta_velocity(
         self,
-        bg_new: np.ndarray | None = None,
-        ba_new: np.ndarray | None = None
-    ) -> np.ndarray:
+        bg_new = None,
+        ba_new = None
+    ) :
         """零偏变化后的一阶修正速度: dv_updated = dv + J_v_bg * dbg + J_v_ba * dba"""
         dbg = self.d_bg if bg_new is None else (np.asarray(bg_new, dtype=np.float64).reshape(3) - self.bg)
         dba = self.d_ba if ba_new is None else (np.asarray(ba_new, dtype=np.float64).reshape(3) - self.ba)
@@ -166,9 +166,9 @@ class ImuPreintegrator:
 
     def get_updated_delta_position(
         self,
-        bg_new: np.ndarray | None = None,
-        ba_new: np.ndarray | None = None
-    ) -> np.ndarray:
+        bg_new = None,
+        ba_new = None
+    ) :
         """零偏变化后的一阶修正位置: dp_updated = dp + J_p_bg * dbg + J_p_ba * dba"""
         dbg = self.d_bg if bg_new is None else (np.asarray(bg_new, dtype=np.float64).reshape(3) - self.bg)
         dba = self.d_ba if ba_new is None else (np.asarray(ba_new, dtype=np.float64).reshape(3) - self.ba)
@@ -176,10 +176,10 @@ class ImuPreintegrator:
 
     def predict_state(
         self,
-        T_wb_i: SE3,
-        v_w_i: np.ndarray,
-        g_w: np.ndarray = np.array([0.0, 0.0, -9.81], dtype=np.float64)
-    ) -> tuple[SE3, np.ndarray]:
+        T_wb_i,
+        v_w_i,
+        g_w = np.array([0.0, 0.0, -9.81], dtype=np.float64)
+    ) :
         """
         根据上一帧 Body 位姿 T_wb_i 与世界系速度 v_w_i，利用预积分结果预测当前帧位姿 T_wb_j 与速度 v_w_j
         """
