@@ -436,8 +436,38 @@ class WitMotionSerialIMU:
                 pass
         else:
             try:
+                import glob as _glob
                 import serial
-                self._pyserial_obj = serial.Serial(self.port, self.baud, timeout=0.02)
+                linux_cands = []
+                if self.port and not str(self.port).upper().startswith("COM"):
+                    linux_cands.append(self.port)
+                for p_cand in sorted(_glob.glob("/dev/ttyUSB*")) + sorted(_glob.glob("/dev/ttyACM*")) + ["/dev/ttyS3", "/dev/ttyS4", "/dev/ttyS2"]:
+                    if p_cand not in linux_cands:
+                        linux_cands.append(p_cand)
+                first_ser = None
+                for p_cand in linux_cands:
+                    try:
+                        ser = serial.Serial(p_cand, self.baud, timeout=0.18)
+                        probe = ser.read(64)
+                        if probe and (0x55 in probe):
+                            self._pyserial_obj = ser
+                            self.port = p_cand
+                            if first_ser is not None and first_ser is not ser:
+                                first_ser.close()
+                            break
+                        if first_ser is None:
+                            first_ser = ser
+                            self.port = p_cand
+                        else:
+                            ser.close()
+                    except Exception:
+                        continue
+                if self._pyserial_obj is None and first_ser is not None:
+                    self._pyserial_obj = first_ser
+                if self._pyserial_obj is None:
+                    self.is_connected = False
+                    return False
+                self._pyserial_obj.timeout = 0.02
                 self.is_connected = True
                 try:
                     self._pyserial_obj.write(b"\xFF\xAA\x69\x88\xB5")
@@ -640,7 +670,7 @@ class WitMotionSerialIMU:
 
 
 def open_camera_capture(cam_id):
-    """兼容 OpenCV 3.4.2 (单参数 VideoCapture(id)) 与 OpenCV 4.x (双参数 VideoCapture(id, apiPreference)) 的摄像头打开函数"""
+    """兼容 OpenCV 3.4.2 (单参数 VideoCapture(id))、OpenCV 4.x 与 RK3566 Linux V4L2 的摄像头打开函数"""
     cid = int(cam_id)
     if os.name == "nt":
         try:
@@ -660,7 +690,27 @@ def open_camera_capture(cam_id):
                 return cap
             if cap is not None:
                 cap.release()
-    return cv2.VideoCapture(cid)
+    else:
+        try:
+            v4l2_flag = getattr(cv2, "CAP_V4L2", 200)
+            cap = cv2.VideoCapture(cid, v4l2_flag)
+            if cap is not None and cap.isOpened():
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                except Exception:
+                    pass
+                return cap
+            if cap is not None:
+                cap.release()
+        except TypeError:
+            pass
+    cap = cv2.VideoCapture(cid)
+    if os.name != "nt" and cap is not None and cap.isOpened():
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
+    return cap
 
 
 def find_stereo_camera_id(

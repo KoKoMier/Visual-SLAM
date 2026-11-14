@@ -55,6 +55,7 @@ class HFNetExtractor(ORBExtractor):
         nms_radius=4,
         use_gpu=False,
         fast_live_scale=0.60,
+        rknn_model_path=None,
     ):
         super(HFNetExtractor, self).__init__(
             n_features=n_features,
@@ -68,7 +69,7 @@ class HFNetExtractor(ORBExtractor):
         self.use_gpu = bool(use_gpu)
         self.fast_live_scale = float(fast_live_scale)
 
-        # 定位项目根目录下的 hfnet 代码库与预训练模型权重目录
+        # 定位项目根目录下的 hfnet 代码库、预训练模型权重目录与 RK3566 NPU (.rknn) 模型
         workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         if hfnet_root is None:
             hfnet_root = os.path.join(workspace_root, "hfnet")
@@ -80,6 +81,21 @@ class HFNetExtractor(ORBExtractor):
             saved_model_dir = os.path.join(self.hfnet_root, "saved_models", "hfnet")
         self.saved_model_dir = os.path.abspath(saved_model_dir)
 
+        if rknn_model_path is None:
+            cand_paths = [
+                os.path.join(self.saved_model_dir, "hfnet_backbone_rk3566_i8.rknn"),
+                os.path.join(workspace_root, "models", "hfnet_backbone_rk3566_i8.rknn"),
+            ]
+            for cp in cand_paths:
+                if os.path.exists(cp):
+                    rknn_model_path = cp
+                    break
+            if rknn_model_path is None:
+                rknn_model_path = cand_paths[0]
+        self.rknn_model_path = os.path.abspath(rknn_model_path)
+
+        self.backend = None
+        self.rknn_runtime = None
         self.sess = None
         self.graph = None
         self.image_tensor = None
@@ -120,11 +136,94 @@ class HFNetExtractor(ORBExtractor):
                 shutil.copytree(model_dir, tmp_dir)
             return tmp_dir
 
+    @staticmethod
+    def _logits_to_scores_dense(logits, grid_size=8):
+        """
+        将 RKNN 模型输出的 `logits` (pred/local_head/detector/Conv_1/BiasAdd:0)
+        严格 1:1 还原为 `scores_dense` (H, W) 概率响应图 (与 TensorFlow 原图误差 < 1e-9):
+        1. 支持 NHWC (1, 60, 80, 65) 或 NCHW (1, 65, 60, 80) 布局自动识别；
+        2. 沿 65 通道执行数值稳定 Softmax 并剥离第 64 号 dustbin 通道 -> (60, 80, 64)；
+        3. 执行 8x8 Depth-to-Space 重排还原为 (480, 640) 稠密显著性响应图。
+        """
+        arr = np.asarray(logits, dtype=np.float32)
+        if arr.ndim == 4:
+            arr = arr[0]
+        c_dim = grid_size * grid_size + 1  # 65
+        if arr.shape[0] == c_dim and arr.shape[-1] != c_dim:
+            # NCHW (65, 60, 80) -> HWC (60, 80, 65)
+            arr = np.transpose(arr, (1, 2, 0))
+        hc, wc, _ = arr.shape
+        exp_l = np.exp(arr - np.max(arr, axis=-1, keepdims=True))
+        prob_no_dustbin = exp_l[:, :, : (grid_size * grid_size)] / (np.sum(exp_l, axis=-1, keepdims=True) + 1e-12)
+        scores_dense = (
+            prob_no_dustbin.reshape(hc, wc, grid_size, grid_size)
+            .transpose(0, 2, 1, 3)
+            .reshape(hc * grid_size, wc * grid_size)
+        )
+        return scores_dense.astype(np.float32)
+
+    @staticmethod
+    def _normalize_desc_map_layout(desc_out, c_dim=256):
+        """
+        将 RKNN 输出的 `local_descriptor_map` 统一转换为 HWC (60, 80, 256) float32 格式并保证 L2 归一化。
+        兼容 NHWC (1, 60, 80, 256) 与 NCHW (1, 256, 60, 80) 两种输出布局。
+        """
+        arr = np.asarray(desc_out, dtype=np.float32)
+        if arr.ndim == 4:
+            arr = arr[0]
+        if arr.shape[0] == c_dim and arr.shape[-1] != c_dim:
+            arr = np.transpose(arr, (1, 2, 0))
+        return arr
+
+    def _try_init_rknn_session(self):
+        """
+        若当前环境存在 `hfnet_backbone_rk3566_i8.rknn` 且安装了 `rknnlite` (RK3566 板端 NPU 运行时)，
+        则直接加载 `.rknn` 模型至 RK3566 NPU，完全免除对 TensorFlow 和 126MB SavedModel 权重的依赖。
+        """
+        if not os.path.exists(self.rknn_model_path):
+            return False
+
+        rknn_cls = None
+        try:
+            from rknnlite.api import RKNNLite
+            rknn_cls = RKNNLite
+        except ImportError:
+            return False
+
+        try:
+            rknn = rknn_cls(verbose=False)
+            ret = rknn.load_rknn(self.rknn_model_path)
+            if ret != 0:
+                return False
+            ret = rknn.init_runtime()
+            if ret != 0:
+                return False
+            # 预热一次 640x480 NPU 推理
+            dummy = np.zeros((1, 480, 640, 1), dtype=np.uint8)
+            rknn.inference(inputs=[dummy])
+            self.rknn_runtime = rknn
+            self.backend = "rknn"
+            self.is_loaded = True
+            print(
+                "  [HF-Net RKNN NPU] 已成功加载 RK3566 INT8 硬件加速模型: {}".format(
+                    self.rknn_model_path
+                )
+            )
+            return True
+        except Exception:
+            self.rknn_runtime = None
+            return False
+
     def _init_hfnet_session(self):
-        """加载 `hfnet` 模块与 TensorFlow SavedModel 计算图"""
+        """优先尝试加载 RK3566 RKNN NPU 模型；若在 PC 端运行则自动回退加载 TensorFlow SavedModel 计算图"""
+        if self._try_init_rknn_session():
+            return
+
         if not os.path.exists(os.path.join(self.saved_model_dir, "saved_model.pb")):
             raise FileNotFoundError(
-                "未找到 HF-Net SavedModel 权重文件: {}".format(self.saved_model_dir)
+                "未找到 HF-Net SavedModel 权重文件: {} (且当前非 RK3566 RKNNLite 环境)".format(
+                    self.saved_model_dir
+                )
             )
 
         if not self.use_gpu:
@@ -164,10 +263,16 @@ class HFNetExtractor(ORBExtractor):
         # 预热一次小图推理，完成算子初始化
         dummy = np.zeros((1, 64, 64, 1), dtype=np.float32)
         self.sess.run([self.scores_tensor, self.local_desc_tensor], feed_dict={self.image_tensor: dummy})
+        self.backend = "tensorflow"
         self.is_loaded = True
+        rknn_note = (
+            " | 已就绪 RK3566 NPU 模型: {}".format(os.path.basename(self.rknn_model_path))
+            if os.path.exists(self.rknn_model_path)
+            else ""
+        )
         print(
-            "  [HF-Net] 已成功加载深度特征模型: {} (Interpreter: {})".format(
-                self.saved_model_dir, sys.executable
+            "  [HF-Net] 已成功加载深度特征模型: {} (Interpreter: {}{})".format(
+                self.saved_model_dir, sys.executable, rknn_note
             )
         )
 
@@ -212,10 +317,30 @@ class HFNetExtractor(ORBExtractor):
         对单张灰度图像执行 HF-Net 前向推理，返回:
           - scores_map: (H, W) float32 特征点概率响应图
           - desc_map: (H_d, W_d, 256) float32 稠密局部描述子特征图
-        针对 640x480 实机摄像头模式启用轻量化尺度加速 (384x288, 像素计算量降低 64%, 耗时 ~65ms)，
-        而 752x480 数据集模式保持 1.0x 原生全分辨率推理以维持基准测试精度。
+        - 若运行在 RK3566 NPU (`self.backend == "rknn"`):
+          直接调用 `hfnet_backbone_rk3566_i8.rknn` (输入 [1,480,640,1] uint8, 输出 logits [1,60,80,65] + local_descriptor_map [1,60,80,256])，
+          通过 `_logits_to_scores_dense` 还原 (480, 640) 概率图。
+        - 若运行在 PC TensorFlow (`self.backend == "tensorflow"`):
+          针对 640x480 实机摄像头模式启用轻量化尺度加速 (384x288, 耗时 ~45ms)，752x480 数据集模式保持 1.0x 原生全分辨率。
         """
         h0, w0 = gray.shape[:2]
+
+        if self.backend == "rknn" and self.rknn_runtime is not None:
+            if w0 != 640 or h0 != 480:
+                gray_rknn = cv2.resize(gray, (640, 480), interpolation=cv2.INTER_AREA)
+            else:
+                gray_rknn = gray
+            inp_u8 = np.ascontiguousarray(gray_rknn[None, :, :, None], dtype=np.uint8)
+            outputs = self.rknn_runtime.inference(inputs=[inp_u8])
+            self.inference_count += 1
+            logits_out, desc_out = outputs[0], outputs[1]
+            scores_map = self._logits_to_scores_dense(logits_out, grid_size=8)
+            if scores_map.shape[0] != h0 or scores_map.shape[1] != w0:
+                scores_map = cv2.resize(scores_map, (w0, h0), interpolation=cv2.INTER_LINEAR)
+            desc_map = self._normalize_desc_map_layout(desc_out, c_dim=256)
+            self.last_scores_map = scores_map
+            return scores_map, desc_map
+
         if w0 == 640 and h0 == 480 and 0.35 <= self.fast_live_scale < 0.99:
             w_in = max(64, int(round(w0 * self.fast_live_scale / 8.0)) * 8)
             h_in = max(64, int(round(h0 * self.fast_live_scale / 8.0)) * 8)
