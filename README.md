@@ -9,9 +9,9 @@
 1. **李群李代数与流形预积分 (`src/core/lie_algebra.py`, `src/frontend/imu_preintegration.py`)**
    - 显式实现 $\text{SO}(3)/\text{SE}(3)$ 指数/对数映射（往返精度 `5.22e-16`）与右雅可比矩阵 $\mathbf{J}_r(\boldsymbol{\phi})$。
    - 完整实现 Forster 流形预积分（$\Delta \mathbf{R}_{ij}, \Delta \mathbf{v}_{ij}, \Delta \mathbf{p}_{ij}$）、$15 \times 15$ 协方差递推与零偏一阶雅可比在线修正。
-2. **RK3566 混合光流 + 四叉树 ORB 前端 (`src/frontend/`)**
-   - **普通帧快速路径**：基于 200Hz IMU 陀螺仪先验的 4 层双向金字塔 LK 光流跟踪 + 二维结构张量极线立体匹配（普通帧中位耗时 `24.75 ms`）。
-   - **关键帧路径**：8 层图像金字塔 + 四叉树均匀化 FAST/ORB 特征提取 + 局部共视地图投影跟踪 (`TrackLocalMap`)。
+2. **RK3566 混合光流 + HF-Net 深度学习特征前端 (`src/frontend/hfnet_extractor.py`, `src/frontend/tracker.py`)**
+   - **普通帧快速路径**：基于 IMU 陀螺仪先验的 4 层双向金字塔 LK 光流跟踪 + 后台异步 UVC 抓帧线程（普通帧中位耗时 `23.8 ms`）。
+   - **关键帧路径**：集成 **HF-Net** (`scores_dense` + 256 维 `local_descriptor_map`) 深度学习特征与八层金字塔四叉树均匀化提取；内置 **RK3566 INT8 NPU 量化模型 (`models/hfnet_backbone_rk3566_i8.rknn`, 668 KB)**，支持在 RK3566 板端通过 `RKNNLite` 硬件加速推理，PC 端自动回退 TensorFlow SavedModel。
    - **多传感器模式**：支持 **双目 + IMU (`track_stereo_inertial`)**、**单目 + IMU (`track_monocular_inertial`)**、**纯双目 (`track_stereo`)** 与 **纯单目 (`track_monocular`)**。
 3. **显式解析雅可比与稀疏舒尔补后端 (`src/backend/`)**
    - 4 轮 Huber 鲁棒核 + 卡方检验的 6DoF 视觉-惯性紧耦合位姿优化 (`pose_optimization`) 与重力方向 Roll/Pitch 闭环可观性约束。
@@ -45,11 +45,11 @@ python run_phase1_demo.py
 # 2. 运行 EuRoC MAV 真实数据集双目+IMU评测
 python run_phase1_demo.py --euroc data/EuRoC_MH_01_easy/mav0 --max_frames 150
 
-# 3. 运行实机 USB 单目摄像头 (640x480) + 串口 IMU (COM4 @ 9600) 实时单目惯性 SLAM (按 'q' 退出)
-python run_phase1_demo.py --live --mono_imu --cam_id 1 --imu_port COM4
+# 3. PC 端 (Conda hfnet 环境) 运行实机 USB 摄像头 + 串口 IMU 实时 SLAM (按 'q' 退出)
+C:\Users\14163\miniconda3\envs\hfnet\python.exe run_phase1_demo.py --live --show
 
-# 4. 运行实机 USB 同步拼接双目摄像头 (1280x480) + 串口 IMU 实时双目惯性 SLAM
-python run_phase1_demo.py --live --cam_id 0 --imu_port COM4
+# 4. RK3566 板端 (Ubuntu/Debian aarch64, 自动加载内置 hfnet_backbone_rk3566_i8.rknn NPU 模型)
+python3 run_phase1_demo.py --live
 
 # 5. 单目 / 双目摄像头内外参 + 相机与 IMU 手眼外参 (T_b_c1) 标定工具
 python calibrate_mono_camera.py --cam_id 1

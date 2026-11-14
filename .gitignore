@@ -1,6 +1,11 @@
 # Ignored reference repositories, datasets, calibration snapshots, and generated outputs
 ORB_SLAM3-master/
-hfnet/
+hfnet/*
+!hfnet/saved_models/
+hfnet/saved_models/*
+!hfnet/saved_models/hfnet/
+hfnet/saved_models/hfnet/*
+!hfnet/saved_models/hfnet/hfnet_backbone_rk3566_i8.rknn
 data/
 outputs/
 calib_images/
