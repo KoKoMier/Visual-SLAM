@@ -36,7 +36,7 @@ class KeyFrame:
         "kp_pts", "kp_octaves", "kp_angles", "descriptors",
         "u_right", "depths", "num_kps",
         "map_points",
-        "T_cw", "v_w", "bg", "ba",
+        "T_cw", "v_w", "bg", "ba", "R_cw_imu_prior",
         "scale_factors", "inv_scale_factors",
         "level_sigma2", "inv_level_sigma2",
         "grid_element_width_inv", "grid_element_height_inv", "grid",
@@ -69,6 +69,9 @@ class KeyFrame:
         self.v_w: np.ndarray = frame.v_w.copy()
         self.bg: np.ndarray = frame.bg.copy()
         self.ba: np.ndarray = frame.ba.copy()
+        self.R_cw_imu_prior: np.ndarray | None = (
+            frame.R_cw_imu_prior.copy() if frame.R_cw_imu_prior is not None else None
+        )
 
         self.scale_factors = frame.scale_factors.copy()
         self.inv_scale_factors = frame.inv_scale_factors.copy()
@@ -185,6 +188,27 @@ class KeyFrame:
         u, v = float(self.kp_pts[i, 0]), float(self.kp_pts[i, 1])
         p_c = self.camera.unproject_depth(u, v, z)
         return self.T_cw.inverse().transform(p_c)
+
+    def compute_scene_median_depth(self, q: int = 2) -> float:
+        """
+        对应 ORB-SLAM3 KeyFrame::ComputeSceneMedianDepth(q):
+        计算该关键帧所有有效地图点在相机坐标系下 Z 轴深度的中位数 (q=2) 或均值 (q=1)。
+        """
+        zs = []
+        R_cw = self.T_cw.R
+        t_cw = self.T_cw.t
+        for mp in self.map_points:
+            if mp is not None and not mp.is_bad:
+                z = float(R_cw[2] @ mp.pos_w + t_cw[2])
+                if z > 0.0:
+                    zs.append(z)
+        if len(zs) == 0:
+            return 1.0
+        zs.sort()
+        if q == 2:
+            return float(zs[len(zs) // 2])
+        else:
+            return float(np.mean(zs))
 
     # =========================================================================
     # 共视图 (Covisibility Graph) 与生成树 (Spanning Tree) 核心维护方法

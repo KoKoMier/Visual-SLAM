@@ -88,6 +88,12 @@ class StereoCamera:
         校正后更新当前相机的有效内参 fx, fy, cx, cy, baseline, bf
         """
         img_size = (self.width, self.height)
+        K_l = np.ascontiguousarray(K_l, dtype=np.float64).reshape(3, 3)
+        D_l = np.ascontiguousarray(D_l, dtype=np.float64).reshape(-1, 1)
+        K_r = np.ascontiguousarray(K_r, dtype=np.float64).reshape(3, 3)
+        D_r = np.ascontiguousarray(D_r, dtype=np.float64).reshape(-1, 1)
+        R_r_l = np.ascontiguousarray(R_r_l, dtype=np.float64).reshape(3, 3)
+        t_r_l = np.ascontiguousarray(t_r_l, dtype=np.float64).reshape(3, 1)
         R1, R2, P1, P2, _, _, _ = cv2.stereoRectify(
             K_l, D_l, K_r, D_r, img_size, R_r_l, t_r_l,
             flags=cv2.CALIB_ZERO_DISPARITY, alpha=0

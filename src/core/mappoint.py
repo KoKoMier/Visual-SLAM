@@ -22,6 +22,9 @@ if TYPE_CHECKING:
     from .keyframe import KeyFrame
     from .map import Map
 
+# 模块级预计算 0~255 字节 popcount 查表，避免每次调用 compute_distinctive_descriptors 时重复构建
+_POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(256)], dtype=np.int32)
+
 
 class MapPoint:
     _next_id: int = 0
@@ -133,6 +136,16 @@ class MapPoint:
         if slam_map is not None:
             slam_map.erase_mappoint(self)
 
+    def get_replaced(self) -> MapPoint | None:
+        """
+        对应 ORB-SLAM3 MapPoint::GetReplaced():
+        返回当前地图点被融合替换后的最终目标 MapPoint（支持传递替换链解析）。
+        """
+        mp = self.replaced_by
+        while mp is not None and mp.replaced_by is not None and mp.replaced_by.id != mp.id:
+            mp = mp.replaced_by
+        return mp
+
     def is_in_keyframe(self, kf: KeyFrame) -> bool:
         return kf in self.observations
 
@@ -164,16 +177,16 @@ class MapPoint:
                 descs.append(kf.descriptors[idx])
         if len(descs) == 0:
             return
-        if len(descs) == 1:
+        if len(descs) <= 2:
+            # 1 或 2 个观测时两两距离对称，直接取首个描述子即可，省去 unpackbits 开销
             self.descriptor = descs[0].copy()
             return
 
         desc_mat = np.asarray(descs, dtype=np.uint8)
         n = len(desc_mat)
-        # 利用 OpenCV NORM_HAMMING 或位运算快速计算 N x N 汉明距离矩阵
-        # 展开为二进制比特或使用 popcount 查表 (与 C++ NEON vcntq_u8 逻辑一致)
+        # 利用模块级 popcount 查表快速计算 N x N 汉明距离矩阵
         xor_mat = desc_mat[:, None, :] ^ desc_mat[None, :, :]  # (N, N, 32)
-        dist_mat = np.unpackbits(xor_mat, axis=-1).sum(axis=-1)  # (N, N)
+        dist_mat = _POPCOUNT_LUT[xor_mat].sum(axis=-1)  # (N, N)
         dist_sorted = np.sort(dist_mat, axis=1)
         median_dists = dist_sorted[:, n // 2]
         best_idx = int(np.argmin(median_dists))

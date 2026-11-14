@@ -60,13 +60,23 @@ class SLAMSystem:
         timestamp: float
     ) -> SE3:
         """纯单目无 IMU 跟踪接口 (对应 ORB_SLAM3::System::TrackMonocular)"""
+        return self.track_monocular_inertial(img_left, timestamp, imu_measurements=None)
+
+    def track_monocular_inertial(
+        self,
+        img_left: np.ndarray,
+        timestamp: float,
+        imu_measurements: list[ImuMeasurement] | None = None
+    ) -> SE3:
+        """单目 + IMU 紧耦合跟踪接口 (对应 ORB_SLAM3::System::TrackMonocular with IMU)"""
         prev_ref_kf = self.tracker.ref_kf
-        T_cw = self.tracker.grab_image_monocular(img_left, timestamp)
+        T_cw = self.tracker.grab_image_monocular(img_left, timestamp, imu_measurements)
         ref_kf = self.tracker.ref_kf
         is_kf = bool(self.tracker.last_is_keyframe)
+        prior_T_cr = self.tracker.last_flow_prior_T_cr
         if ref_kf is not None:
             T_cr = T_cw * ref_kf.T_cw.inverse()
-            self.frame_history.append((float(timestamp), T_cr, ref_kf, is_kf, prev_ref_kf, None))
+            self.frame_history.append((float(timestamp), T_cr, ref_kf, is_kf, prev_ref_kf, prior_T_cr))
         else:
             self.frame_history.append((float(timestamp), T_cw, None, is_kf, None, None))
         return T_cw

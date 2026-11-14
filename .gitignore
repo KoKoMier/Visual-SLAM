@@ -1,9 +1,14 @@
-# Ignored reference repositories, datasets, and generated outputs
+# Ignored reference repositories, datasets, calibration snapshots, and generated outputs
 ORB_SLAM3-master/
 data/
 outputs/
+calib_images/
+calib_verify/
+*.log
+*.npz
+*.bag
 
-# Python bytecode & cache
+# Python bytecode, cache & virtual environments
 __pycache__/
 *.py[cod]
 *$py.class
@@ -12,6 +17,9 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+.venv/
+venv/
+env/
 
 # IDE & OS files
 .vscode/

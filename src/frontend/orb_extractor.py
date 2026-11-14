@@ -229,7 +229,8 @@ class ORBExtractor:
         cell_size = 35  # 网格尺寸 (像素)
         border = self.EDGE_THRESHOLD
 
-        for level in range(self.n_levels):
+        max_levels = 4 if image.shape[1] == 640 else self.n_levels
+        for level in range(max_levels):
             img_lvl = pyramid[level]
             h, w = img_lvl.shape[:2]
             min_x, min_y = border, border
@@ -237,53 +238,88 @@ class ORBExtractor:
             if max_x <= min_x or max_y <= min_y:
                 continue
 
-            # 1. 双阈值网格化 FAST 角点提取 + 二维结构张量特征值各向同性评分 (彻底抑制白板边框等高对比度 1D 直线边缘)
-            gx = cv2.Sobel(img_lvl, cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(img_lvl, cv2.CV_32F, 0, 1, ksize=3)
-            ixx_map = cv2.boxFilter(gx * gx, cv2.CV_32F, (5, 5))
-            iyy_map = cv2.boxFilter(gy * gy, cv2.CV_32F, (5, 5))
-            ixy_map = cv2.boxFilter(gx * gy, cv2.CV_32F, (5, 5))
-            tr_map = ixx_map + iyy_map
-            det_map = ixx_map * iyy_map - ixy_map * ixy_map
-            lmin_map = 0.5 * (tr_map - np.sqrt(np.maximum(0.0, tr_map * tr_map - 4.0 * det_map)))
-
             level_kps: list[cv2.KeyPoint] = []
-            w_Span = max_x - min_x
-            h_Span = max_y - min_y
-            n_cols = max(1, int(w_Span / cell_size))
-            n_rows = max(1, int(h_Span / cell_size))
-            w_cell = int(np.ceil(float(w_Span) / n_cols))
-            h_cell = int(np.ceil(float(h_Span) / n_rows))
-
-            for r in range(n_rows):
-                y0 = min_y + r * h_cell
-                y1 = min(max_y, y0 + h_cell + 6)
-                if y0 >= max_y - 3:
-                    continue
-                for c in range(n_cols):
-                    x0 = min_x + c * w_cell
-                    x1 = min(max_x, x0 + w_cell + 6)
-                    if x0 >= max_x - 3:
-                        continue
-                    patch = img_lvl[y0:y1, x0:x1]
-                    cell_kps = self._fast_high.detect(patch, None)
-                    if len(cell_kps) == 0:
-                        cell_kps = self._fast_low.detect(patch, None)
-                    for kp in cell_kps:
-                        abs_x = kp.pt[0] + x0
-                        abs_y = kp.pt[1] + y0
-                        iy = min(h - 1, max(0, int(np.round(abs_y))))
-                        ix = min(w - 1, max(0, int(np.round(abs_x))))
-                        lmin = float(lmin_map[iy, ix])
-                        tr = float(tr_map[iy, ix])
-                        if lmin < 120.0 or tr <= 1e-3:
-                            continue
-                        isotropy = lmin / tr
-                        if isotropy < 0.055:
-                            continue
-                        kp.response = lmin * isotropy
-                        kp.pt = (abs_x - min_x, abs_y - min_y)
+            if image.shape[1] == 640:
+                # 实机 640x480 实时高速通道: 仅在前 4 层金字塔执行单次 C++ FAST 检测 + 局部关键点梯度张量评估 (免去全图 5 次 float32 滤波与开方)
+                roi = img_lvl[min_y:max_y, min_x:max_x]
+                raw_kps = self._fast_high.detect(roi, None)
+                if len(raw_kps) < int(self.n_features_per_level[level]) * 2:
+                    raw_kps = self._fast_low.detect(roi, None)
+                if len(raw_kps) > 0:
+                    gx = cv2.Sobel(img_lvl, cv2.CV_32F, 1, 0, ksize=3)
+                    gy = cv2.Sobel(img_lvl, cv2.CV_32F, 0, 1, ksize=3)
+                    pts_uv = cv2.KeyPoint_convert(raw_kps)
+                    ix_arr = np.clip(np.round(pts_uv[:, 0] + min_x).astype(np.int32), 1, w - 2)
+                    iy_arr = np.clip(np.round(pts_uv[:, 1] + min_y).astype(np.int32), 1, h - 2)
+                    ixx = np.zeros(len(ix_arr), dtype=np.float32)
+                    iyy = np.zeros(len(ix_arr), dtype=np.float32)
+                    ixy = np.zeros(len(ix_arr), dtype=np.float32)
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            gxi = gx[iy_arr + dy, ix_arr + dx]
+                            gyi = gy[iy_arr + dy, ix_arr + dx]
+                            ixx += gxi * gxi
+                            iyy += gyi * gyi
+                            ixy += gxi * gyi
+                    tr_vals = ixx + iyy
+                    det_vals = ixx * iyy - ixy * ixy
+                    lmin_vals = 0.5 * (tr_vals - np.sqrt(np.maximum(0.0, tr_vals * tr_vals - 4.0 * det_vals)))
+                    valid_mask = (lmin_vals >= 90.0) & (tr_vals > 1e-3)
+                    iso_vals = np.where(valid_mask, lmin_vals / np.maximum(tr_vals, 1e-3), 0.0)
+                    valid_mask = valid_mask & (iso_vals >= 0.05)
+                    scores = lmin_vals * iso_vals
+                    valid_indices = np.nonzero(valid_mask)[0]
+                    for idx_k in valid_indices:
+                        kp = raw_kps[int(idx_k)]
+                        kp.response = float(scores[idx_k])
                         level_kps.append(kp)
+            else:
+                # 1. 双阈值网格化 FAST 角点提取 + 二维结构张量特征值各向同性评分 (彻底抑制白板边框等高对比度 1D 直线边缘)
+                gx = cv2.Sobel(img_lvl, cv2.CV_32F, 1, 0, ksize=3)
+                gy = cv2.Sobel(img_lvl, cv2.CV_32F, 0, 1, ksize=3)
+                ixx_map = cv2.boxFilter(gx * gx, cv2.CV_32F, (5, 5))
+                iyy_map = cv2.boxFilter(gy * gy, cv2.CV_32F, (5, 5))
+                ixy_map = cv2.boxFilter(gx * gy, cv2.CV_32F, (5, 5))
+                tr_map = ixx_map + iyy_map
+                det_map = ixx_map * iyy_map - ixy_map * ixy_map
+                lmin_map = 0.5 * (tr_map - np.sqrt(np.maximum(0.0, tr_map * tr_map - 4.0 * det_map)))
+
+                w_Span = max_x - min_x
+                h_Span = max_y - min_y
+                n_cols = max(1, int(w_Span / cell_size))
+                n_rows = max(1, int(h_Span / cell_size))
+                w_cell = int(np.ceil(float(w_Span) / n_cols))
+                h_cell = int(np.ceil(float(h_Span) / n_rows))
+
+                for r in range(n_rows):
+                    y0 = min_y + r * h_cell
+                    y1 = min(max_y, y0 + h_cell + 6)
+                    if y0 >= max_y - 3:
+                        continue
+                    for c in range(n_cols):
+                        x0 = min_x + c * w_cell
+                        x1 = min(max_x, x0 + w_cell + 6)
+                        if x0 >= max_x - 3:
+                            continue
+                        patch = img_lvl[y0:y1, x0:x1]
+                        cell_kps = self._fast_high.detect(patch, None)
+                        if len(cell_kps) == 0:
+                            cell_kps = self._fast_low.detect(patch, None)
+                        for kp in cell_kps:
+                            abs_x = kp.pt[0] + x0
+                            abs_y = kp.pt[1] + y0
+                            iy = min(h - 1, max(0, int(np.round(abs_y))))
+                            ix = min(w - 1, max(0, int(np.round(abs_x))))
+                            lmin = float(lmin_map[iy, ix])
+                            tr = float(tr_map[iy, ix])
+                            if lmin < 120.0 or tr <= 1e-3:
+                                continue
+                            isotropy = lmin / tr
+                            if isotropy < 0.055:
+                                continue
+                            kp.response = lmin * isotropy
+                            kp.pt = (abs_x - min_x, abs_y - min_y)
+                            level_kps.append(kp)
 
             # 2. 四叉树均匀化筛选
             n_desired = int(self.n_features_per_level[level])

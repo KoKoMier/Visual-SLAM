@@ -5,24 +5,28 @@ run_phase1_demo.py
 阶段 1：Windows 纯 Python 算法原型全面验证与端到端评测脚本
 所有评测报告、轨迹文件与摄像头运动视频流程图统一输出至 `outputs/` 文件夹。
 
-支持两种运行模式:
+支持三种运行模式:
 1. 默认模式 (零外部数据集依赖):
    `python run_phase1_demo.py`
 2. EuRoC 真实数据集模式:
    `python run_phase1_demo.py --euroc data/EuRoC_MH_01_easy/mav0 --max_frames 150`
+3. 实机 USB 双目摄像头 + 串口 IMU 实时模式:
+   `python run_phase1_demo.py --live --max_frames 60`
 """
 
 from __future__ import annotations
 import argparse
 import os
+import cv2
 import numpy as np
 
 from src.core.lie_algebra import SE3, log_so3
 from src.core.camera import StereoCamera
 from src.frontend.imu_preintegration import ImuPreintegrator
 from src.system import SLAMSystem
-from src.dataset import SyntheticStereoInertialDataset, EuRoCDataset
-from src.visualizer import FrameVisRecord, SLAMVideoFlowVisualizer
+from src.dataset import SyntheticStereoInertialDataset, EuRoCDataset, LiveStereoInertialStream
+from src.visualizer import FrameVisRecord, SLAMVideoFlowVisualizer, Live3DTrajectorySketch
+from src.blackbox_logger import BlackboxLogger, print_blackbox_history
 
 
 def verify_core_operators() -> None:
@@ -150,6 +154,11 @@ def run_synthetic_benchmark(num_frames: int = 80, output_dir: str = "outputs") -
         max_local_kfs=8,
         use_hybrid_optical_flow=True
     )
+    blackbox = BlackboxLogger(
+        output_dir=output_dir,
+        mode="synthetic_stereo_imu",
+        metadata={"num_frames": num_frames, "fx": cam.fx, "baseline_m": cam.baseline},
+    )
 
     gt_positions = []
     vis_records: list[FrameVisRecord] = []
@@ -163,6 +172,7 @@ def run_synthetic_benchmark(num_frames: int = 80, output_dir: str = "outputs") -
         imus = dataset.imu_batches[k]
 
         slam.track_stereo_inertial(img_l, img_r, ts, imus)
+        blackbox.log_frame(k, ts, slam, imu_batch=imus)
         vis_records.append(_collect_frame_vis_record(slam, k, ts, gt_pos))
 
         if (k + 1) % 20 == 0 or k == 0 or k == num_frames - 1:
@@ -221,6 +231,8 @@ def run_synthetic_benchmark(num_frames: int = 80, output_dir: str = "outputs") -
         prefix="synthetic",
         fps=15,
     )
+    bb_dir = blackbox.finalize(artifact_paths=[eval_png, est_txt, gt_txt])
+    print(f"  [黑盒日志归档] 本次运行历史黑盒日志已保存至: {os.path.abspath(bb_dir)}")
 
 
 def run_euroc_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "outputs") -> None:
@@ -240,6 +252,11 @@ def run_euroc_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "
         max_local_kfs=8,
         use_hybrid_optical_flow=True
     )
+    blackbox = BlackboxLogger(
+        output_dir=output_dir,
+        mode="euroc_stereo_imu",
+        metadata={"mav0_dir": mav0_dir, "max_frames": n_run},
+    )
 
     gt_positions = []
     valid_frame_indices = []
@@ -248,6 +265,7 @@ def run_euroc_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "
     for k in range(n_run):
         img_l, img_r, ts, imus, gt_pos = dataset.get_item(k)
         slam.track_stereo_inertial(img_l, img_r, ts, imus)
+        blackbox.log_frame(k, ts, slam, imu_batch=imus)
         vis_records.append(_collect_frame_vis_record(slam, k, ts, gt_pos))
 
         if gt_pos is not None:
@@ -317,6 +335,34 @@ def run_euroc_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "
         prefix="euroc",
         fps=15,
     )
+    bb_dir = blackbox.finalize(artifact_paths=[eval_png, est_txt, gt_txt])
+    print(f"  [黑盒日志归档] 本次运行历史黑盒日志已保存至: {os.path.abspath(bb_dir)}")
+
+    sketch_euroc = Live3DTrajectorySketch(width=1280, height=500)
+    sketch_panel = None
+    for idx_r, rec in enumerate(vis_records):
+        R_al = metrics["R_align"] @ rec.R_wc_raw
+        t_al = (metrics["R_align"] @ rec.t_wc_raw) + metrics["t_align"]
+        sketch_panel = sketch_euroc.update_and_render(
+            frame_idx=idx_r,
+            timestamp=rec.timestamp,
+            R_wc=R_al,
+            t_wc=t_al,
+            map_points_w=aligned_mps,
+            is_keyframe=rec.is_keyframe,
+            tracking_state_name="OK",
+            num_kfs=rec.num_keyframes,
+            num_mps=rec.num_mappoints,
+            inliers=rec.inlier_count,
+            imu_acc=np.array([0.0, 0.0, -9.81]),
+            imu_gyro=np.zeros(3),
+            imu_euler_deg=np.rad2deg(log_so3(R_al)),
+            fps=1000.0 / max(1.0, rec.frontend_ms),
+        )
+    if sketch_panel is not None:
+        sketch_out = os.path.join(output_dir, "euroc_3d_trajectory_sketch.png")
+        cv2.imwrite(sketch_out, sketch_panel)
+        print(f"  [3D简图已保存] 实时 3D 轨迹简图面板  : {os.path.abspath(sketch_out)}")
 
 
 def run_euroc_monocular_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "outputs") -> None:
@@ -341,6 +387,11 @@ def run_euroc_monocular_sequence(mav0_dir: str, max_frames: int = 150, output_di
         max_local_kfs=8,
         use_hybrid_optical_flow=True
     )
+    blackbox = BlackboxLogger(
+        output_dir=output_dir,
+        mode="euroc_mono",
+        metadata={"mav0_dir": mav0_dir, "max_frames": n_run},
+    )
 
     gt_positions = []
     valid_frame_indices = []
@@ -350,6 +401,7 @@ def run_euroc_monocular_sequence(mav0_dir: str, max_frames: int = 150, output_di
         img_l, _, ts, _, gt_pos = dataset.get_item(k)
         # 仅输入单目左图 img_l 与时间戳 ts (无右目，无 IMU)
         slam.track_monocular(img_l, ts)
+        blackbox.log_frame(k, ts, slam)
         vis_records.append(_collect_frame_vis_record(slam, k, ts, gt_pos))
 
         if gt_pos is not None:
@@ -444,6 +496,146 @@ def run_euroc_monocular_sequence(mav0_dir: str, max_frames: int = 150, output_di
         ate_metrics=mono_plot_metrics,
         output_dir=output_dir,
         prefix="euroc_mono",
+        fps=15,
+    )
+    bb_dir = blackbox.finalize(artifact_paths=[eval_mono_png])
+    print(f"  [黑盒日志归档] 本次运行历史黑盒日志已保存至: {os.path.abspath(bb_dir)}")
+
+
+def run_euroc_monocular_inertial_sequence(mav0_dir: str, max_frames: int = 150, output_dir: str = "outputs") -> None:
+    """
+    单目 + IMU 紧耦合模式评测 (Monocular-Inertial VIO):
+    仅输入左目 cam0 单张灰度图像 + 200Hz IMU (屏蔽右目 cam1)，
+    验证 IMU 陀螺仪旋转流形先验对单目掉头尺度漂移的抑制效果以及惯性尺度恢复精度。
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    print("\n" + "=" * 72)
+    print(f"[EuRoC 单目 + IMU (Monocular-Inertial VIO) 评测] 加载目录: {mav0_dir}")
+    print("=" * 72)
+
+    cam = StereoCamera.create_euroc_camera()
+    dataset = EuRoCDataset(mav0_dir)
+    n_run = min(len(dataset), max_frames)
+    print(f"  加载左目 cam0 单目帧数: {n_run} | 右目 cam1: 已禁用 | IMU (200Hz ADIS16448): 已启用")
+
+    slam = SLAMSystem(
+        camera=cam,
+        n_features=650,
+        max_local_kfs=8,
+        use_hybrid_optical_flow=True
+    )
+    blackbox = BlackboxLogger(
+        output_dir=output_dir,
+        mode="euroc_mono_imu",
+        metadata={"mav0_dir": mav0_dir, "max_frames": n_run},
+    )
+
+    gt_positions = []
+    valid_frame_indices = []
+    vis_records: list[FrameVisRecord] = []
+
+    for k in range(n_run):
+        img_l, _, ts, imus, gt_pos = dataset.get_item(k)
+        slam.track_monocular_inertial(img_l, ts, imus)
+        blackbox.log_frame(k, ts, slam, imu_batch=imus)
+        vis_records.append(_collect_frame_vis_record(slam, k, ts, gt_pos))
+
+        if gt_pos is not None:
+            gt_positions.append(gt_pos)
+            valid_frame_indices.append(k)
+
+        if (k + 1) % 20 == 0 or k == 0 or k == n_run - 1:
+            print(
+                f"  Mono+IMU    [{k+1:4d}/{n_run:4d}] | "
+                f"State: {slam.tracker.state.name:15s} | "
+                f"KeyFrames: {slam.slam_map.num_keyframes():3d} | "
+                f"MapPoints: {slam.slam_map.num_mappoints():4d} | "
+                f"IMUs: {len(imus):2d}"
+            )
+
+    _sync_final_poses_to_records(slam, vis_records)
+    est_all, _ = slam.get_camera_trajectory()
+    est_valid = est_all[valid_frame_indices]
+    gt_valid = np.asarray(gt_positions, dtype=np.float64)
+
+    metrics = SLAMSystem.evaluate_ate(est_valid, gt_valid)
+    fe_times = np.asarray(slam.tracker.timing_stats["frontend_ms"])
+    be_times = np.asarray(slam.tracker.timing_stats["backend_ms"])
+    tot_times = np.asarray(slam.tracker.timing_stats["total_ms"])
+
+    print("\n" + "-" * 72)
+    print("  [EuRoC 单目 + IMU (Monocular-Inertial VIO) 评测结果汇总]")
+    print(f"  - 评测总帧数 (Frames)                  : {n_run}")
+    print(f"  - 最终活跃关键帧数 (KeyFrames)         : {slam.slam_map.num_keyframes()}")
+    print(f"  - 最终活跃 3D 地图点数 (MapPoints)      : {slam.slam_map.num_mappoints()}")
+    print(f"  - 真实物理尺度误差 ATE (SE3, s=1.0)    : {metrics['aligned_rmse_m']*100:.2f} cm (中位数: {metrics['aligned_median_m']*100:.2f} cm)")
+    print(f"  - 惯性尺度因子偏差 (Sim3 Scale s*)     : {metrics['sim3_scale']:.4f}x (理想值 1.0000x)")
+    print(f"  - 尺度精修后误差 ATE (Sim3 RMSE, s=s*) : {metrics['sim3_rmse_m']*100:.2f} cm (中位数: {metrics['sim3_median_m']*100:.2f} cm)")
+    print(f"  - 前端跟踪平均耗时 (Frontend)          : {fe_times.mean():.2f} ms (中位数: {np.median(fe_times):.2f} ms)")
+    print(f"  - 后端建图分摊耗时 (Backend)           : {be_times.mean():.2f} ms (仅关键帧触发)")
+    print(f"  - 系统平均帧率 (Average FPS)           : {1000.0 / max(1e-3, tot_times.mean()):.1f} FPS")
+    print("-" * 72)
+
+    est_aligned = metrics["est_aligned"]
+    raw_mps = slam.get_map_points_xyz()
+    if len(raw_mps) > 0:
+        aligned_mps = (raw_mps @ metrics["R_align"].T) + metrics["t_align"]
+    else:
+        aligned_mps = raw_mps
+
+    np.savetxt(
+        os.path.join(output_dir, "euroc_mono_imu_trajectory_est.txt"),
+        est_aligned,
+        fmt="%.6f",
+        header="tx ty tz (meters, SE3 aligned)",
+    )
+    eval_mono_imu_png = os.path.join(output_dir, "euroc_mono_imu_slam_evaluation.png")
+    _save_evaluation_plot(
+        est_aligned,
+        gt_valid,
+        aligned_mps,
+        fe_times[valid_frame_indices],
+        be_times[valid_frame_indices],
+        metrics,
+        out_path=eval_mono_imu_png,
+    )
+
+    sketch_mono_imu = Live3DTrajectorySketch(width=1280, height=500)
+    sketch_panel = None
+    for idx_r, rec in enumerate(vis_records):
+        R_al = metrics["R_align"] @ rec.R_wc_raw
+        t_al = (metrics["R_align"] @ rec.t_wc_raw) + metrics["t_align"]
+        sketch_panel = sketch_mono_imu.update_and_render(
+            frame_idx=idx_r,
+            timestamp=rec.timestamp,
+            R_wc=R_al,
+            t_wc=t_al,
+            map_points_w=aligned_mps,
+            is_keyframe=rec.is_keyframe,
+            tracking_state_name="OK",
+            num_kfs=rec.num_keyframes,
+            num_mps=rec.num_mappoints,
+            inliers=rec.inlier_count,
+            imu_acc=np.array([0.0, 0.0, 9.81]),
+            imu_gyro=np.zeros(3),
+            imu_euler_deg=np.rad2deg(log_so3(R_al)),
+            fps=1000.0 / max(1.0, rec.frontend_ms),
+        )
+    if sketch_panel is not None:
+        sketch_out = os.path.join(output_dir, "euroc_mono_imu_3d_trajectory_sketch.png")
+        cv2.imwrite(sketch_out, sketch_panel)
+        print(f"  [3D简图已保存] 单目+IMU 3D 轨迹简图面板: {os.path.abspath(sketch_out)}")
+    bb_dir = blackbox.finalize(artifact_paths=[eval_mono_imu_png])
+    print(f"  [黑盒日志归档] 本次运行历史黑盒日志已保存至: {os.path.abspath(bb_dir)}")
+
+    visualizer = SLAMVideoFlowVisualizer()
+    visualizer.render_all_outputs(
+        records=vis_records,
+        R_align=metrics["R_align"],
+        t_align=metrics["t_align"],
+        ate_metrics=metrics,
+        output_dir=output_dir,
+        prefix="euroc_mono_imu",
         fps=15,
     )
 
@@ -608,17 +800,471 @@ def _save_mono_vs_stereo_comparison_plot(
     print(f"  [对比图已保存] 双目+IMU vs 纯单目对比图: {os.path.abspath(out_path)}")
 
 
+def _save_live_hardware_plot(
+    timestamps: np.ndarray,
+    est_pos: np.ndarray,
+    map_pts: np.ndarray,
+    acc_history: np.ndarray,
+    gyro_history: np.ndarray,
+    euler_history: np.ndarray,
+    fe_times: np.ndarray,
+    be_times: np.ndarray,
+    out_path: str,
+    is_monocular: bool = False,
+) -> None:
+    """绘制实机 USB 双目/单目摄像头 + 串口 IMU 实时采集与 SLAM 跟踪四合一评测报告图"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"  [提示] Matplotlib 绘图跳过: {exc}")
+        return
+
+    fig = plt.figure(figsize=(15, 10), dpi=140)
+    mode_tag = "Monocular + IMU" if is_monocular else "Stereo + IMU"
+
+    # 1. 3D 实时相机轨迹与稀疏地图点云
+    ax1 = fig.add_subplot(2, 2, 1, projection="3d")
+    if len(map_pts) > 0:
+        mask = np.linalg.norm(map_pts, axis=1) < 15.0
+        pts_vis = map_pts[mask]
+        ax1.scatter(pts_vis[:, 0], pts_vis[:, 2], pts_vis[:, 1], c="#90a4ae", s=4, alpha=0.5, label="3D MapPoints")
+    ax1.plot(est_pos[:, 0], est_pos[:, 2], est_pos[:, 1], color="#d32f2f", linewidth=2.2, label="Live Camera 6DoF Trajectory")
+    ax1.scatter([est_pos[0, 0]], [est_pos[0, 2]], [est_pos[0, 1]], c="green", s=60, label="Start")
+    ax1.set_title(f"Live USB {mode_tag} 3D Trajectory ({len(est_pos)} Frames, {len(map_pts)} MapPoints)")
+    ax1.set_xlabel("X (m)")
+    ax1.set_ylabel("Z (m)")
+    ax1.set_zlabel("Y (m)")
+    ax1.legend(loc="upper right", fontsize=8)
+
+    # 2. 串口 IMU 三轴加速度与重力模长实时波形 (m/s^2)
+    ax2 = fig.add_subplot(2, 2, 2)
+    g_norm = np.linalg.norm(acc_history, axis=1)
+    ax2.plot(timestamps, acc_history[:, 0], color="#e53935", linewidth=1.5, label="Acc X (m/s²)")
+    ax2.plot(timestamps, acc_history[:, 1], color="#43a047", linewidth=1.5, label="Acc Y (m/s²)")
+    ax2.plot(timestamps, acc_history[:, 2], color="#1e88e5", linewidth=1.5, label="Acc Z (m/s²)")
+    ax2.plot(timestamps, g_norm, "k--", linewidth=1.8, label=f"|g| Norm (mean={g_norm.mean():.2f} m/s²)")
+    ax2.set_title("Live Serial IMU 3-Axis Acceleration & Gravity Norm")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Acceleration (m/s²)")
+    ax2.grid(True, linestyle=":", alpha=0.6)
+    ax2.legend(loc="best", fontsize=8)
+
+    # 3. 串口 IMU 三轴角速度 (rad/s) 与欧拉姿态角 (deg)
+    ax3 = fig.add_subplot(2, 2, 3)
+    ax3.plot(timestamps, gyro_history[:, 0], color="#d81b60", linewidth=1.4, label="Gyro Wx (rad/s)")
+    ax3.plot(timestamps, gyro_history[:, 1], color="#00897b", linewidth=1.4, label="Gyro Wy (rad/s)")
+    ax3.plot(timestamps, gyro_history[:, 2], color="#3949ab", linewidth=1.4, label="Gyro Wz (rad/s)")
+    ax3_twin = ax3.twinx()
+    ax3_twin.plot(timestamps, euler_history[:, 0], color="#ff8f00", linestyle="--", alpha=0.75, label="Roll (deg)")
+    ax3_twin.plot(timestamps, euler_history[:, 1], color="#6d4c41", linestyle=":", alpha=0.75, label="Pitch (deg)")
+    ax3_twin.plot(timestamps, euler_history[:, 2], color="#5e35b1", linestyle="-.", alpha=0.75, label="Yaw (deg)")
+    ax3.set_title("Live Serial IMU Angular Velocity (rad/s) & Attitude (deg)")
+    ax3.set_xlabel("Time (s)")
+    ax3.set_ylabel("Gyro (rad/s)")
+    ax3_twin.set_ylabel("Euler Angle (deg)")
+    ax3.grid(True, linestyle=":", alpha=0.6)
+    lines1, labels1 = ax3.get_legend_handles_labels()
+    lines2, labels2 = ax3_twin.get_legend_handles_labels()
+    ax3.legend(lines1 + lines2, labels1 + labels2, loc="best", ncol=2, fontsize=8)
+
+    # 4. 逐帧前后端实时耗时统计
+    ax4 = fig.add_subplot(2, 2, 4)
+    frames_x = np.arange(len(fe_times))
+    ax4.plot(frames_x, fe_times, color="#1976d2", linewidth=1.6, label=f"Frontend Track (median={np.median(fe_times):.1f}ms)")
+    ax4.bar(frames_x, be_times, color="#ffa000", alpha=0.6, label="Backend Local BA")
+    ax4.axhline(33.3, color="#d32f2f", linestyle="--", linewidth=1.2, label="30 FPS Budget (33.3ms)")
+    ax4.set_title("Live Hardware Per-Frame Runtime Breakdown")
+    ax4.set_xlabel("Frame Index")
+    ax4.set_ylabel("Time (ms)")
+    ax4.grid(True, linestyle=":", alpha=0.6)
+    ax4.legend(loc="upper right", fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close(fig)
+    print(f"  [图表已保存] 实机双目+IMU评测图已生成至: {os.path.abspath(out_path)}")
+
+
+def run_live_hardware_slam(
+    cam_id: int = -1,
+    concat_width: int = 1280,
+    height: int = 480,
+    imu_port: str = "COM3",
+    imu_baud: int = 9600,
+    calib_json: str = "config/custom_stereo_imu.json",
+    max_frames: int = 0,
+    output_dir: str = "outputs",
+    show_gui: bool = True,
+    force_monocular: bool = False,
+) -> None:
+    """
+    实机 USB 双目 (1280x480) 或 单目 (640x480) 摄像头 + 串口 IMU 实时 SLAM 跟踪与可视化评测主流程
+    (持续运行，仅当用户在窗口按下 'q' 键时退出)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    print("\n" + "=" * 72)
+    print("[实机硬件 SLAM 模式] 正在初始化 USB 摄像头与串口 IMU...")
+    print("=" * 72)
+
+    stream = LiveStereoInertialStream(
+        cam_id=cam_id,
+        concat_width=concat_width,
+        height=height,
+        imu_port=imu_port,
+        imu_baud=imu_baud,
+        calib_json=calib_json,
+        force_monocular=force_monocular,
+    )
+    mode_tag = "单目 + IMU (Mono-Inertial)" if stream.is_monocular else "双目 + IMU (Stereo-Inertial)"
+    imu_snap = stream.imu.get_status_snapshot()
+    if stream.is_monocular:
+        print(f"  [Camera] 已连接单目摄像头 ID={stream.cam_id} | 分辨率={stream.half_w}x{height} | 运行模式: {mode_tag}")
+    else:
+        print(f"  [Camera] 已连接双目摄像头 ID={stream.cam_id} | 拼接分辨率={concat_width}x{height} (单目={stream.half_w}x{height}) | 运行模式: {mode_tag}")
+    print(f"  [Calib ] 相机参数来源: {stream.calib_source}")
+    if imu_snap["connected"]:
+        acc0 = imu_snap["acc_mps2"]
+        gyro0 = imu_snap["gyro_rads"]
+        eul0 = imu_snap["euler_deg"]
+        print(
+            f"  [IMU   ] 已连接串口 {imu_snap['port']} @ {imu_snap['baud']} bps | 已收包: {imu_snap['total_packets']} | "
+            f"温度: {imu_snap['temp_c']:.2f} °C"
+        )
+        print(
+            f"           初始加速度 Acc=[{acc0[0]:+.3f}, {acc0[1]:+.3f}, {acc0[2]:+.3f}] m/s² (|g|={np.linalg.norm(acc0):.3f}) | "
+            f"姿态角 Roll={eul0[0]:+.1f}°, Pitch={eul0[1]:+.1f}°, Yaw={eul0[2]:+.1f}°"
+        )
+    else:
+        print(f"  [IMU   ] 警告: 未能打开串口 {imu_port}，将退化为纯视觉模式运行。")
+
+    slam = SLAMSystem(
+        camera=stream.camera,
+        n_features=600,
+        max_local_kfs=8,
+        use_hybrid_optical_flow=True,
+    )
+    run_mode_str = "live_mono_imu" if stream.is_monocular else "live_stereo_imu"
+    blackbox = BlackboxLogger(
+        output_dir=output_dir,
+        mode=run_mode_str,
+        metadata={
+            "cam_id": int(stream.cam_id),
+            "resolution": f"{stream.half_w}x{height}",
+            "is_monocular": bool(stream.is_monocular),
+            "calib_source": str(stream.calib_source),
+            "fx": float(stream.camera.fx),
+            "fy": float(stream.camera.fy),
+            "cx": float(stream.camera.cx),
+            "cy": float(stream.camera.cy),
+            "imu_port": str(imu_snap.get("port", imu_port)),
+            "imu_baud": int(imu_snap.get("baud", imu_baud)),
+            "imu_connected": bool(imu_snap.get("connected", False)),
+        },
+    )
+    print(f"  [Blackbox] 实时黑盒记录已启动 -> {os.path.abspath(blackbox.run_dir)}")
+
+    vis_records: list[FrameVisRecord] = []
+    ts_list: list[float] = []
+    acc_list: list[np.ndarray] = []
+    gyro_list: list[np.ndarray] = []
+    euler_list: list[np.ndarray] = []
+    sample_pair_saved = False
+
+    sketch_3d = Live3DTrajectorySketch(width=1280, height=500)
+    last_sketch_panel: np.ndarray | None = None
+    last_combined_dashboard: np.ndarray | None = None
+    R_imu_ref: np.ndarray | None = None
+
+    def _euler_to_R(eul_deg: np.ndarray) -> np.ndarray:
+        r, p, y = np.deg2rad(eul_deg[0]), np.deg2rad(eul_deg[1]), np.deg2rad(eul_deg[2])
+        cr, sr = np.cos(r), np.sin(r)
+        cp, sp = np.cos(p), np.sin(p)
+        cy, sy = np.cos(y), np.sin(y)
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
+        Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
+        Rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        return Rz @ Ry @ Rx
+
+    print("  [提示   ] 实机窗口已开启，将持续运行，在画面窗口按 'q' 键退出。")
+    k = 0
+    try:
+        while True:
+            img_l, img_r, ts, imus, imu_status = stream.read_frame()
+            if stream.is_monocular:
+                slam.track_monocular_inertial(img_l, ts, imus)
+            else:
+                slam.track_stereo_inertial(img_l, img_r, ts, imus)
+
+            blackbox.log_frame(k, ts, slam, imu_batch=imus, imu_status=imu_status)
+            rec = _collect_frame_vis_record(slam, k, ts, gt_pos=None)
+            eul_cur = imu_status["euler_deg"]
+            R_wb_cur = _euler_to_R(eul_cur)
+            if R_imu_ref is None:
+                R_imu_ref = R_wb_cur.copy()
+
+            # 若视觉尚未完成三角化初始化，使用实测 IMU 相对旋转实时驱动 3D 视锥体姿态
+            if slam.tracker.state.name != "OK" and R_imu_ref is not None:
+                R_bc = stream.camera.T_b_c1[:3, :3]
+                rec.R_wc_raw = R_bc.T @ (R_imu_ref.T @ R_wb_cur) @ R_bc
+
+            rec.gt_pos = rec.t_wc_raw.copy()
+            vis_records.append(rec)
+
+            ts_list.append(ts)
+            acc_list.append(imu_status["acc_mps2"])
+            gyro_list.append(imu_status["gyro_rads"])
+            euler_list.append(eul_cur)
+
+            if stream.is_monocular:
+                rect_l = stream.camera.rectify_mono(img_l)
+                left_vis = cv2.cvtColor(rect_l, cv2.COLOR_GRAY2BGR)
+                for p0_uv, p1_uv in zip(rec.prev_uv, rec.curr_uv):
+                    cv2.line(
+                        left_vis,
+                        (int(p0_uv[0]), int(p0_uv[1])),
+                        (int(p1_uv[0]), int(p1_uv[1])),
+                        (0, 255, 120),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                for pt in slam.tracker.curr_frame.kp_pts[:280]:
+                    cv2.circle(left_vis, (int(pt[0]), int(pt[1])), 3, (0, 220, 255), -1, cv2.LINE_AA)
+
+                right_info = np.full_like(left_vis, (24, 28, 36))
+                cv2.rectangle(right_info, (12, 48), (628, 468), (58, 68, 82), 1)
+                acc_c = imu_status["acc_mps2"]
+                gyr_c = imu_status["gyro_rads"]
+                raw_e = imu_status.get("raw_euler_deg", eul_cur)
+                lines_right = [
+                    "MONOCULAR + IMU TIGHTLY-COUPLED VIO",
+                    f"Camera Device : USB Camera ID={stream.cam_id} ({stream.half_w}x{height})",
+                    f"Serial IMU    : {imu_status['port']} @ {imu_status['baud']} bps (Packets={imu_status['total_packets']})",
+                    f"Tracker State : {slam.tracker.state.name}  |  Inliers: {rec.inlier_count}",
+                    f"Active Map    : KeyFrames = {rec.num_keyframes}  |  3D MapPoints = {rec.num_mappoints}",
+                    f"Camera Pos (m): X={rec.t_wc_raw[0]:+.3f}, Y={rec.t_wc_raw[1]:+.3f}, Z={rec.t_wc_raw[2]:+.3f}",
+                    f"IMU Acc (m/s2): Ax={acc_c[0]:+.2f}, Ay={acc_c[1]:+.2f}, Az={acc_c[2]:+.2f} (|g|={np.linalg.norm(acc_c):.2f})",
+                    f"IMU Gyro(rad/s): Wx={gyr_c[0]:+.3f}, Wy={gyr_c[1]:+.3f}, Wz={gyr_c[2]:+.3f}",
+                    f"Attitude (deg): Roll={eul_cur[0]:+.1f}, Pitch={eul_cur[1]:+.1f}, Yaw={eul_cur[2]:+.1f}",
+                    f"Raw IMU (deg) : Roll={raw_e[0]:+.1f}, Pitch={raw_e[1]:+.1f}, Yaw={raw_e[2]:+.1f}",
+                ]
+                for li, ltxt in enumerate(lines_right):
+                    col_t = (0, 230, 255) if li == 0 else ((120, 255, 160) if li in (3, 4, 5) else (215, 225, 235))
+                    cv2.putText(right_info, ltxt, (28, 82 + li * 36), cv2.FONT_HERSHEY_SIMPLEX, 0.50, col_t, 1, cv2.LINE_AA)
+                hud = np.hstack([left_vis, right_info])
+            else:
+                rect_l, rect_r = stream.camera.rectify_stereo(img_l, img_r)
+                hud = cv2.cvtColor(np.hstack([rect_l, rect_r]), cv2.COLOR_GRAY2BGR)
+                for p0_uv, p1_uv in zip(rec.prev_uv, rec.curr_uv):
+                    cv2.line(
+                        hud,
+                        (int(p0_uv[0]), int(p0_uv[1])),
+                        (int(p1_uv[0]), int(p1_uv[1])),
+                        (0, 255, 120),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                for pt in slam.tracker.curr_frame.kp_pts[:250]:
+                    cv2.circle(hud, (int(pt[0]), int(pt[1])), 3, (0, 220, 255), -1, cv2.LINE_AA)
+
+            if not sample_pair_saved and (k == 5 or len(rec.keypoints_uv) > 10):
+                pair_vis = hud.copy()
+                for y in range(24, pair_vis.shape[0], 32):
+                    cv2.line(pair_vis, (0, y), (pair_vis.shape[1], y), (0, 200, 0), 1, cv2.LINE_AA)
+                sample_path = os.path.join(output_dir, "live_stereo_pair_sample.png")
+                cv2.imwrite(sample_path, pair_vis)
+                sample_pair_saved = True
+
+            tot_ms_last = max(1.0, float(slam.tracker.timing_stats["total_ms"][-1]))
+            inst_fps = 1000.0 / tot_ms_last
+            title_mode = "Live Mono+IMU VIO" if stream.is_monocular else "Live Stereo+IMU SLAM"
+            info_txt = (
+                f"{title_mode} | Frame {k+1} [Press 'q' to quit] | State: {slam.tracker.state.name} | "
+                f"KFs: {slam.slam_map.num_keyframes()} | MPs: {slam.slam_map.num_mappoints()} | "
+                f"IMU RPY: ({eul_cur[0]:+.1f}, {eul_cur[1]:+.1f}, {eul_cur[2]:+.1f}) deg"
+            )
+            cv2.rectangle(hud, (0, 0), (hud.shape[1], 36), (20, 24, 30), -1)
+            cv2.putText(hud, info_txt, (14, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 235, 255), 2, cv2.LINE_AA)
+
+            # 实时渲染 3D 轨迹简图面板与上下拼接大屏
+            last_sketch_panel = sketch_3d.update_and_render(
+                frame_idx=k,
+                timestamp=ts,
+                R_wc=rec.R_wc_raw,
+                t_wc=rec.t_wc_raw,
+                map_points_w=rec.all_mp_xyz_raw,
+                is_keyframe=rec.is_keyframe,
+                tracking_state_name=slam.tracker.state.name,
+                num_kfs=rec.num_keyframes,
+                num_mps=rec.num_mappoints,
+                inliers=rec.inlier_count,
+                imu_acc=imu_status["acc_mps2"],
+                imu_gyro=imu_status["gyro_rads"],
+                imu_euler_deg=eul_cur,
+                fps=inst_fps,
+                stereo_top_hud=None,
+            )
+            last_combined_dashboard = np.vstack([hud, last_sketch_panel])
+
+            if (k + 1) % 30 == 0 or k == 0:
+                acc_cur = imu_status["acc_mps2"]
+                raw_eul = imu_status.get("raw_euler_deg", eul_cur)
+                print(
+                    f"  Live Frame [{k+1:4d}] | "
+                    f"State: {slam.tracker.state.name:15s} | "
+                    f"KFs: {slam.slam_map.num_keyframes():2d} | "
+                    f"MPs: {slam.slam_map.num_mappoints():4d} | "
+                    f"IMUs: {len(imus):2d} | "
+                    f"|g|: {np.linalg.norm(acc_cur):.2f}m/s² | "
+                    f"RPY: ({eul_cur[0]:+.1f}°, {eul_cur[1]:+.1f}°, {eul_cur[2]:+.1f}°) "
+                    f"[Raw: ({raw_eul[0]:+.1f}°, {raw_eul[1]:+.1f}°, {raw_eul[2]:+.1f}°)]"
+                )
+                if (k + 1) % 60 == 0 or k == 0:
+                    if last_sketch_panel is not None:
+                        cv2.imwrite(os.path.join(output_dir, "live_3d_trajectory_sketch.png"), last_sketch_panel)
+                    if last_combined_dashboard is not None:
+                        cv2.imwrite(os.path.join(output_dir, "live_slam_dashboard_combined.png"), last_combined_dashboard)
+
+            cv2.imshow("Live USB Stereo + IMU SLAM & 3D Trajectory Sketch", last_combined_dashboard)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q")):
+                print("\n  [用户退出] 检测到按键 'q'，正在退出并保存评测数据...")
+                break
+            sketch_3d.handle_key(key)
+            k += 1
+    except KeyboardInterrupt:
+        print("\n  [用户中断] 收到 Ctrl+C，正在保存当前已采集的 3D 轨迹简图与位姿数据...")
+    finally:
+        stream.close()
+        cv2.destroyAllWindows()
+
+    sketch_path = os.path.join(output_dir, "live_3d_trajectory_sketch.png")
+    dash_path = os.path.join(output_dir, "live_slam_dashboard_combined.png")
+    if last_sketch_panel is not None:
+        cv2.imwrite(sketch_path, last_sketch_panel)
+        print(f"  [3D简图已保存] 实时 3D 轨迹简图面板  : {os.path.abspath(sketch_path)}")
+    if last_combined_dashboard is not None:
+        cv2.imwrite(dash_path, last_combined_dashboard)
+        print(f"  [监控大屏保存] 双目画面+3D轨迹简图大屏: {os.path.abspath(dash_path)}")
+
+    if len(vis_records) == 0:
+        bb_dir = blackbox.finalize()
+        print(f"  [黑盒日志已归档] 本次运行历史黑盒目录: {os.path.abspath(bb_dir)}")
+        return
+
+    _sync_final_poses_to_records(slam, vis_records)
+    for rec in vis_records:
+        rec.gt_pos = rec.t_wc_raw.copy()
+
+    est_positions, _ = slam.get_camera_trajectory()
+    fe_times = np.asarray(slam.tracker.timing_stats["frontend_ms"])
+    be_times = np.asarray(slam.tracker.timing_stats["backend_ms"])
+    tot_times = np.asarray(slam.tracker.timing_stats["total_ms"])
+    ts_arr = np.asarray(ts_list, dtype=np.float64)
+    acc_arr = np.asarray(acc_list, dtype=np.float64)
+    gyro_arr = np.asarray(gyro_list, dtype=np.float64)
+    euler_arr = np.asarray(euler_list, dtype=np.float64)
+
+    mode_cn = "单目摄像头 + 串口 IMU" if stream.is_monocular else "双目摄像头 + 串口 IMU"
+    print("\n" + "-" * 72)
+    print(f"  [实机 USB {mode_cn} 实时运行汇总]")
+    print(f"  - 实际采集处理帧数 (Frames)      : {len(vis_records)}")
+    print(f"  - 最终跟踪状态 (Tracker State)   : {slam.tracker.state.name}")
+    print(f"  - 最终活跃关键帧数 (KeyFrames)   : {slam.slam_map.num_keyframes()}")
+    print(f"  - 最终活跃 3D 地图点数 (MapPoints): {slam.slam_map.num_mappoints()}")
+    print(f"  - IMU 累计接收有效帧数           : {stream.imu.total_packets}")
+    print(f"  - IMU 平均重力模长 (|g| Norm)    : {np.linalg.norm(acc_arr, axis=1).mean():.4f} m/s²")
+    print(f"  - 前端跟踪平均耗时 (Frontend)    : {fe_times.mean():.2f} ms (中位数: {np.median(fe_times):.2f} ms)")
+    print(f"  - 系统平均帧率 (Average FPS)     : {1000.0 / max(1e-3, tot_times.mean()):.1f} FPS")
+    print("-" * 72)
+
+    est_txt = os.path.join(output_dir, "live_trajectory_est.txt")
+    imu_txt = os.path.join(output_dir, "live_imu_telemetry.txt")
+    eval_png = os.path.join(output_dir, "live_slam_evaluation.png")
+
+    np.savetxt(est_txt, est_positions, fmt="%.6f", header="tx ty tz (meters)")
+    imu_table = np.column_stack([ts_arr, acc_arr, gyro_arr, euler_arr])
+    np.savetxt(
+        imu_txt,
+        imu_table,
+        fmt="%.6f",
+        header="timestamp_s ax_mps2 ay_mps2 az_mps2 wx_rads wy_rads wz_rads roll_deg pitch_deg yaw_deg",
+    )
+
+    _save_live_hardware_plot(
+        timestamps=ts_arr,
+        est_pos=est_positions,
+        map_pts=slam.get_map_points_xyz(),
+        acc_history=acc_arr,
+        gyro_history=gyro_arr,
+        euler_history=euler_arr,
+        fe_times=fe_times,
+        be_times=be_times,
+        out_path=eval_png,
+        is_monocular=stream.is_monocular,
+    )
+
+    bb_dir = blackbox.finalize(
+        artifact_paths=[dash_path, sketch_path, eval_png, est_txt, imu_txt]
+    )
+    print(f"  [黑盒日志归档] 本次运行历史黑盒日志已完整保存至: {os.path.abspath(bb_dir)}")
+    print(f"                 - 逐帧全状态表 : {os.path.abspath(blackbox.csv_path)}")
+    print(f"                 - 复盘诊断报告 : {os.path.abspath(blackbox.report_path)}")
+
+    dummy_metrics = {
+        "aligned_rmse_m": 0.0,
+        "aligned_median_m": 0.0,
+    }
+    visualizer = SLAMVideoFlowVisualizer()
+    vis_records_out = vis_records[::max(1, len(vis_records) // 180)] if len(vis_records) > 240 else vis_records
+    visualizer.render_all_outputs(
+        records=vis_records_out,
+        R_align=np.eye(3, dtype=np.float64),
+        t_align=np.zeros(3, dtype=np.float64),
+        ate_metrics=dummy_metrics,
+        output_dir=output_dir,
+        prefix="live",
+        fps=15,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 1 Stereo/Stereo-Inertial/Monocular SLAM Validation")
     parser.add_argument("--euroc", type=str, default="", help="Path to EuRoC mav0 directory (optional)")
     parser.add_argument("--mono", action="store_true", help="Run pure Monocular mode (single camera only, no IMU)")
-    parser.add_argument("--max_frames", type=int, default=80, help="Number of frames to process")
+    parser.add_argument("--mono_imu", action="store_true", help="Run Monocular + IMU tightly-coupled VIO mode")
+    parser.add_argument("--live", action="store_true", help="Run live USB Camera (Stereo or Monocular) + Serial IMU mode")
+    parser.add_argument("--history", action="store_true", help="Review historical blackbox run logs and exit")
+    parser.add_argument("--cam_id", type=int, default=-1, help="USB camera device ID (-1 for auto-detect)")
+    parser.add_argument("--imu_port", type=str, default="COM3", help="Serial port for IMU (auto-scans COM4/COM3)")
+    parser.add_argument("--imu_baud", type=int, default=9600, help="Baud rate for serial IMU (default 9600)")
+    parser.add_argument("--calib", type=str, default="config/custom_stereo_imu.json", help="Calibration JSON path")
+    parser.add_argument("--show", action="store_true", help="Show live OpenCV HUD window during --live mode")
+    parser.add_argument("--max_frames", type=int, default=80, help="Number of frames to process (for dataset/synthetic modes)")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Unified directory for all output files")
     args = parser.parse_args()
 
+    if args.history:
+        print_blackbox_history(output_dir=args.output_dir)
+        return
+
     verify_core_operators()
-    if args.euroc and os.path.isdir(args.euroc):
-        if args.mono:
+    if args.live:
+        run_live_hardware_slam(
+            cam_id=args.cam_id,
+            imu_port=args.imu_port,
+            imu_baud=args.imu_baud,
+            calib_json=args.calib,
+            max_frames=args.max_frames,
+            output_dir=args.output_dir,
+            show_gui=True,
+            force_monocular=bool(args.mono or args.mono_imu),
+        )
+    elif args.euroc and os.path.isdir(args.euroc):
+        if args.mono_imu:
+            run_euroc_monocular_inertial_sequence(args.euroc, max_frames=args.max_frames, output_dir=args.output_dir)
+        elif args.mono:
             run_euroc_monocular_sequence(args.euroc, max_frames=args.max_frames, output_dir=args.output_dir)
         else:
             run_euroc_sequence(args.euroc, max_frames=args.max_frames, output_dir=args.output_dir)

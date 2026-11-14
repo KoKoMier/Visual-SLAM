@@ -2,15 +2,21 @@
 """
 dataset.py
 ==========
-数据集加载器与高保真双目+IMU 闭环仿真生成器
+数据集加载器、高保真双目+IMU 闭环仿真生成器与实机 USB 双目+串口 IMU 实时采集流
 1. EuRoCDataset: 标准 EuRoC MAV 数据集加载器 (支持 mav0/cam0, cam1, imu0, state_groundtruth_estimate0)。
 2. SyntheticStereoInertialDataset: 生成带丰富多尺度纹理的 3D 室内外场景双目图像流、200Hz IMU 测量与精确真值轨迹，
    用于零外部依赖下一键验证四叉树 ORB、极线立体匹配、光流跟踪、舒尔补 Local BA 与回环闭合全流程。
+3. WitMotionSerialIMU & LiveStereoInertialStream: 实机 USB 左右拼接双目摄像头 (1280x480) + CH340 串口 IMU (0x55 协议) 实时同步数据流。
 """
 
 from __future__ import annotations
 import os
 import csv
+import struct
+import time
+import threading
+import ctypes
+from ctypes import wintypes
 import numpy as np
 import cv2
 
@@ -239,3 +245,519 @@ class SyntheticStereoInertialDataset:
                     img_r[vl - 4 : vl + 5, ur - 4 : ur + 5] = pat
 
         return img_l, img_r
+
+
+class _Win32DCB(ctypes.Structure):
+    _fields_ = [
+        ("DCBlength", wintypes.DWORD),
+        ("BaudRate", wintypes.DWORD),
+        ("fBitFields", wintypes.DWORD),
+        ("wReserved", wintypes.WORD),
+        ("XonLim", wintypes.WORD),
+        ("XoffLim", wintypes.WORD),
+        ("ByteSize", wintypes.BYTE),
+        ("Parity", wintypes.BYTE),
+        ("StopBits", wintypes.BYTE),
+        ("XonChar", ctypes.c_char),
+        ("XoffChar", ctypes.c_char),
+        ("ErrorChar", ctypes.c_char),
+        ("EofChar", ctypes.c_char),
+        ("EvtChar", ctypes.c_char),
+        ("wReserved1", wintypes.WORD),
+    ]
+
+
+class _Win32CommTimeouts(ctypes.Structure):
+    _fields_ = [
+        ("ReadIntervalTimeout", wintypes.DWORD),
+        ("ReadTotalTimeoutMultiplier", wintypes.DWORD),
+        ("ReadTotalTimeoutConstant", wintypes.DWORD),
+        ("WriteTotalTimeoutMultiplier", wintypes.DWORD),
+        ("WriteTotalTimeoutConstant", wintypes.DWORD),
+    ]
+
+
+class WitMotionSerialIMU:
+    """
+    维特智能 (WitMotion JY901 / WT901 / JY61, CH340 串口) 实时后台 IMU 接收与解析器
+    协议帧格式 (11 字节, 0x55 帧头):
+      - 0x55 0x51: 三轴加速度 Ax, Ay, Az (±16g -> m/s^2) + 温度 T (°C)
+      - 0x55 0x52: 三轴角速度 Wx, Wy, Wz (±2000 deg/s -> rad/s)
+      - 0x55 0x53: 三轴欧拉角 Roll, Pitch, Yaw (±180 deg)
+    支持 Windows 原生 Win32 API (零第三方串口库依赖) 与 Linux/RK3566 pyserial 双后端。
+    """
+
+    def __init__(
+        self,
+        port: str = "COM3",
+        baud: int = 9600,
+        R_mount: np.ndarray | None = None,
+    ):
+        self.port = str(port)
+        self.baud = int(baud)
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._win_handle: int | None = None
+        self._pyserial_obj = None
+
+        # 默认采用水平安装单位阵 R_mount = I_3；启动后将根据重力向量与静态欧拉角自动精化水平归零矩阵
+        if R_mount is not None:
+            self.R_mount = np.asarray(R_mount, dtype=np.float64).reshape(3, 3)
+        else:
+            self.R_mount = np.eye(3, dtype=np.float64)
+
+        self._measurements: list[ImuMeasurement] = []
+        self.latest_raw_acc = np.array([0.0, 0.0, 9.80665], dtype=np.float64)
+        self.latest_raw_gyro = np.zeros(3, dtype=np.float64)
+        self.latest_raw_euler_deg = np.zeros(3, dtype=np.float64)
+        self.latest_acc = np.array([0.0, 0.0, 9.80665], dtype=np.float64)
+        self.latest_gyro = np.zeros(3, dtype=np.float64)
+        self.latest_euler_deg = np.zeros(3, dtype=np.float64)
+        self.latest_temp_c = 25.0
+        self.total_packets = 0
+        self.is_connected = False
+        self._mount_auto_checked = False
+        self._mount_calib_count = 0
+        self._ref_tilt_deg = np.zeros(2, dtype=np.float64)
+
+    @staticmethod
+    def euler_deg_to_R(eul_deg: np.ndarray) -> np.ndarray:
+        """ZYX 欧拉角 (Roll, Pitch, Yaw, 单位: deg) 转 3x3 旋转矩阵 R = Rz(yaw) @ Ry(pitch) @ Rx(roll)"""
+        r, p, y = np.deg2rad(eul_deg[0]), np.deg2rad(eul_deg[1]), np.deg2rad(eul_deg[2])
+        cr, sr = np.cos(r), np.sin(r)
+        cp, sp = np.cos(p), np.sin(p)
+        cy, sy = np.cos(y), np.sin(y)
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
+        Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
+        Rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        return Rz @ Ry @ Rx
+
+    @staticmethod
+    def R_to_euler_deg(R: np.ndarray) -> np.ndarray:
+        """3x3 旋转矩阵反解 ZYX 欧拉角 (Roll, Pitch, Yaw, 单位: deg)"""
+        sy = float(np.clip(-R[2, 0], -1.0, 1.0))
+        pitch = np.arcsin(sy)
+        roll = np.arctan2(R[2, 1], R[2, 2])
+        yaw = np.arctan2(R[1, 0], R[0, 0])
+        return np.rad2deg(np.array([roll, pitch, yaw], dtype=np.float64))
+
+    def start(self) -> bool:
+        """打开串口并启动后台高频接收线程"""
+        if self._running:
+            return self.is_connected
+
+        if os.name == "nt":
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            candidate_ports = [self.port] + [
+                p for p in ("COM4", "COM3", "COM5", "COM6", "COM7", "COM8", "COM1", "COM2") if p != self.port
+            ]
+            h = -1
+            for cand in candidate_ports:
+                h_try = kernel32.CreateFileW(
+                    f"\\\\.\\{cand}",
+                    0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+                    0,
+                    None,
+                    3,  # OPEN_EXISTING
+                    0,
+                    None,
+                )
+                if h_try not in (-1, ctypes.c_void_p(-1).value, None):
+                    h = h_try
+                    self.port = cand
+                    break
+            if h in (-1, ctypes.c_void_p(-1).value, None):
+                self.is_connected = False
+                return False
+
+            dcb = _Win32DCB()
+            dcb.DCBlength = ctypes.sizeof(_Win32DCB)
+            if not kernel32.GetCommState(h, ctypes.byref(dcb)):
+                kernel32.CloseHandle(h)
+                self.is_connected = False
+                return False
+            dcb.BaudRate = self.baud
+            dcb.ByteSize = 8
+            dcb.Parity = 0
+            dcb.StopBits = 0
+            dcb.fBitFields = 1
+            if not kernel32.SetCommState(h, ctypes.byref(dcb)):
+                kernel32.CloseHandle(h)
+                self.is_connected = False
+                return False
+
+            timeouts = _Win32CommTimeouts(5, 1, 15, 1, 15)
+            kernel32.SetCommTimeouts(h, ctypes.byref(timeouts))
+            kernel32.PurgeComm(h, 0x0008 | 0x0004)
+            self._win_handle = h
+            self.is_connected = True
+        else:
+            try:
+                import serial
+                self._pyserial_obj = serial.Serial(self.port, self.baud, timeout=0.02)
+                self.is_connected = True
+            except Exception:
+                self.is_connected = False
+                return False
+
+        self._running = True
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def _read_loop(self) -> None:
+        buf = bytearray()
+        has_acc = False
+
+        if os.name == "nt":
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            chunk = ctypes.create_string_buffer(256)
+            n_read = wintypes.DWORD(0)
+
+            while self._running and self._win_handle is not None:
+                ok = kernel32.ReadFile(self._win_handle, chunk, 256, ctypes.byref(n_read), None)
+                if ok and n_read.value > 0:
+                    buf.extend(chunk.raw[: n_read.value])
+                    has_acc = self._parse_buffer(buf, has_acc)
+                else:
+                    time.sleep(0.002)
+        else:
+            while self._running and self._pyserial_obj is not None:
+                data = self._pyserial_obj.read(256)
+                if data:
+                    buf.extend(data)
+                    has_acc = self._parse_buffer(buf, has_acc)
+                else:
+                    time.sleep(0.002)
+
+    def _parse_buffer(self, buf: bytearray, has_acc: bool) -> bool:
+        while len(buf) >= 11:
+            if buf[0] != 0x55:
+                del buf[0]
+                continue
+            pkt = bytes(buf[:11])
+            if (sum(pkt[:10]) & 0xFF) != pkt[10]:
+                del buf[0]
+                continue
+            del buf[:11]
+
+            ptype = pkt[1]
+            v0, v1, v2, v3 = struct.unpack("<hhhh", pkt[2:10])
+            ts_now = time.perf_counter()
+
+            with self._lock:
+                self.total_packets += 1
+                if ptype == 0x51:  # 加速度帧 (±16g -> m/s^2)
+                    ax = (v0 / 32768.0) * 16.0 * 9.80665
+                    ay = (v1 / 32768.0) * 16.0 * 9.80665
+                    az = (v2 / 32768.0) * 16.0 * 9.80665
+                    raw_acc = np.array([ax, ay, az], dtype=np.float64)
+                    acc_norm = float(np.linalg.norm(raw_acc))
+                    self.latest_raw_acc = raw_acc
+                    if self._mount_calib_count == 0 and 8.2 < acc_norm < 11.5 and az > 6.0:
+                        r_acc = float(np.rad2deg(np.arctan2(ay, az)))
+                        p_acc = float(np.rad2deg(np.arctan2(-ax, np.hypot(ay, az))))
+                        self._ref_tilt_deg = np.array([r_acc, p_acc], dtype=np.float64)
+                        self.R_mount = self.euler_deg_to_R(np.array([r_acc, p_acc, 0.0], dtype=np.float64))
+                    acc_leveled = self.R_mount @ raw_acc
+                    tilt_gyro = float(np.hypot(self.latest_gyro[0], self.latest_gyro[1]))
+                    if (
+                        abs(self.latest_euler_deg[0]) < 6.0
+                        and abs(self.latest_euler_deg[1]) < 6.0
+                        and tilt_gyro < 0.30
+                        and 8.2 < acc_norm < 11.5
+                    ):
+                        acc_leveled[0] *= 0.12
+                        acc_leveled[1] *= 0.12
+                    self.latest_acc = acc_leveled
+                    self.latest_temp_c = float(v3) / 100.0
+                    has_acc = True
+                elif ptype == 0x52:  # 角速度帧 (±2000 deg/s -> rad/s)
+                    wx = np.deg2rad((v0 / 32768.0) * 2000.0)
+                    wy = np.deg2rad((v1 / 32768.0) * 2000.0)
+                    wz = np.deg2rad((v2 / 32768.0) * 2000.0)
+                    self.latest_raw_gyro = np.array([wx, wy, wz], dtype=np.float64)
+                    gyro_leveled = self.R_mount @ self.latest_raw_gyro
+                    # 水平桌面重力约束：当加速度计与姿态角确认设备处于水平面 (|Roll|<6°, |Pitch|<6°) 且无显著翻滚/俯仰角速度
+                    # (或处于快速水平偏航旋转 |Wz| 主导状态) 时，抑制贴装倾角在偏航旋转时向 Roll/Pitch 轴产生的正交耦合分量
+                    tilt_gyro_lvl = float(np.hypot(gyro_leveled[0], gyro_leveled[1]))
+                    yaw_dominant = abs(gyro_leveled[2]) > 1.8 * tilt_gyro_lvl
+                    if (
+                        abs(self.latest_euler_deg[0]) < 6.0
+                        and abs(self.latest_euler_deg[1]) < 6.0
+                        and (tilt_gyro_lvl < 0.35 or yaw_dominant)
+                    ):
+                        gyro_leveled[0] = 0.0 if abs(gyro_leveled[0]) < 0.04 else gyro_leveled[0] * 0.04
+                        gyro_leveled[1] = 0.0 if abs(gyro_leveled[1]) < 0.04 else gyro_leveled[1] * 0.04
+                    self.latest_gyro = gyro_leveled
+                    if has_acc or self.total_packets > 2:
+                        self._measurements.append(
+                            ImuMeasurement(
+                                timestamp=ts_now,
+                                acc=self.latest_acc.copy(),
+                                gyro=self.latest_gyro.copy(),
+                            )
+                        )
+                        if len(self._measurements) > 2000:
+                            del self._measurements[: len(self._measurements) - 1000]
+                elif ptype == 0x53:  # 欧拉角帧 (±180 deg)
+                    roll = (v0 / 32768.0) * 180.0
+                    pitch = (v1 / 32768.0) * 180.0
+                    yaw = (v2 / 32768.0) * 180.0
+                    # 校验串口包物理合理性，拒绝断包错位导致的异常跳变角 (如 -75° 伪包)
+                    if abs(roll) > 65.0 or abs(pitch) > 65.0:
+                        continue
+                    self.latest_raw_euler_deg = np.array([roll, pitch, yaw], dtype=np.float64)
+                    tilt_gyro = float(np.hypot(self.latest_gyro[0], self.latest_gyro[1]))
+                    acc_norm = float(np.linalg.norm(self.latest_raw_acc))
+                    if self._mount_calib_count == 0 and abs(roll) < 40.0 and abs(pitch) < 40.0:
+                        self._ref_tilt_deg = np.array([roll, pitch], dtype=np.float64)
+                        self.R_mount = self.euler_deg_to_R(np.array([roll, pitch, 0.0], dtype=np.float64))
+                        self._mount_calib_count = 1
+                        self._mount_auto_checked = True
+                    elif self._mount_calib_count < 15 and tilt_gyro < 0.30 and abs(roll) < 40.0 and abs(pitch) < 40.0:
+                        alpha = 0.35
+                        self._ref_tilt_deg = (1.0 - alpha) * self._ref_tilt_deg + alpha * np.array([roll, pitch], dtype=np.float64)
+                        self.R_mount = self.euler_deg_to_R(
+                            np.array([self._ref_tilt_deg[0], self._ref_tilt_deg[1], 0.0], dtype=np.float64)
+                        )
+                        self._mount_calib_count += 1
+                    elif (
+                        tilt_gyro < 0.28
+                        and 8.5 < acc_norm < 11.2
+                        and abs(roll - self._ref_tilt_deg[0]) < 12.0
+                        and abs(pitch - self._ref_tilt_deg[1]) < 12.0
+                    ):
+                        # 在水平面平移或绕 Z 轴偏航旋转时，自适应跟踪桌面/贴装基准倾角，消除偏航旋转 180° 时的斜面倾角反转耦合
+                        alpha = 0.20
+                        self._ref_tilt_deg = (1.0 - alpha) * self._ref_tilt_deg + alpha * np.array([roll, pitch], dtype=np.float64)
+                        self.R_mount = self.euler_deg_to_R(
+                            np.array([self._ref_tilt_deg[0], self._ref_tilt_deg[1], 0.0], dtype=np.float64)
+                        )
+                    rel_roll = float(roll - self._ref_tilt_deg[0])
+                    rel_pitch = float(pitch - self._ref_tilt_deg[1])
+                    if abs(rel_roll) < 4.5 and abs(rel_pitch) < 4.5 and tilt_gyro < 0.30:
+                        rel_roll *= 0.12
+                        rel_pitch *= 0.12
+                    self.latest_euler_deg = np.array([rel_roll, rel_pitch, yaw], dtype=np.float64)
+        return has_acc
+
+    def get_measurements_between(self, t_prev: float, t_curr: float) -> list[ImuMeasurement]:
+        """获取 (t_prev, t_curr] 区间内的所有 IMU 采样；若间隔较短尚未到达新串口包，则用最新状态零阶保持补齐"""
+        with self._lock:
+            batch = [m for m in self._measurements if t_prev < m.timestamp <= t_curr]
+            # 清理过旧的历史缓存
+            self._measurements = [m for m in self._measurements if m.timestamp > t_prev - 1.0]
+            if len(batch) == 0 and self.total_packets > 0:
+                batch = [
+                    ImuMeasurement(
+                        timestamp=t_curr,
+                        acc=self.latest_acc.copy(),
+                        gyro=self.latest_gyro.copy(),
+                    )
+                ]
+            return batch
+
+    def get_status_snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "connected": self.is_connected,
+                "port": self.port,
+                "baud": self.baud,
+                "total_packets": int(self.total_packets),
+                "acc_mps2": self.latest_acc.copy(),
+                "gyro_rads": self.latest_gyro.copy(),
+                "euler_deg": self.latest_euler_deg.copy(),
+                "raw_acc_mps2": self.latest_raw_acc.copy(),
+                "raw_gyro_rads": self.latest_raw_gyro.copy(),
+                "raw_euler_deg": self.latest_raw_euler_deg.copy(),
+                "temp_c": float(self.latest_temp_c),
+            }
+
+    def close(self) -> None:
+        self._running = False
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        if os.name == "nt" and self._win_handle is not None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle(self._win_handle)
+            self._win_handle = None
+        elif self._pyserial_obj is not None:
+            try:
+                self._pyserial_obj.close()
+            except Exception:
+                pass
+            self._pyserial_obj = None
+
+
+def find_stereo_camera_id(
+    preferred_id: int = -1,
+    concat_width: int = 1280,
+    height: int = 480,
+) -> int:
+    """
+    自动探测外部 USB 双目摄像头 (1280x480) 或外置 USB 单目摄像头 (640x480):
+    若 preferred_id >= 0 则优先验证该设备；若 preferred_id == -1 则自动扫描索引 1, 0, 2, 3，
+    优先选择支持原生 1280x480 的双目摄像头，其次选择画面有效 (非黑屏隐私盖遮挡) 的外置单目摄像头。
+    """
+    if preferred_id >= 0:
+        return int(preferred_id)
+
+    best_id = 1
+    for cid in [1, 0, 2, 3]:
+        cap = cv2.VideoCapture(cid, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, concat_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        ret, frame = cap.read()
+        cap.release()
+        if ret and frame is not None:
+            h_actual, w_actual = frame.shape[:2]
+            if w_actual == concat_width and h_actual == height:
+                return cid
+            if float(frame.std()) > 3.0 and float(frame.mean()) > 8.0:
+                best_id = cid
+    return best_id
+
+
+class LiveStereoInertialStream:
+    """
+    实机 USB 双目摄像头 (1280x480) / 单目摄像头 (640x480) + 串口 IMU 实时采集器
+    自动识别当前接入的是左右拼接双目摄像头还是单目摄像头 (self.is_monocular)。
+    """
+
+    def __init__(
+        self,
+        cam_id: int = -1,
+        concat_width: int = 1280,
+        height: int = 480,
+        imu_port: str = "COM3",
+        imu_baud: int = 9600,
+        calib_json: str = "config/custom_stereo_imu.json",
+        force_monocular: bool = False,
+    ):
+        self.concat_width = int(concat_width)
+        self.height = int(height)
+        self.half_w = self.concat_width // 2
+        self.cam_id = find_stereo_camera_id(cam_id, concat_width=self.concat_width, height=self.height)
+        self.calib_json = calib_json
+        self.is_monocular = bool(force_monocular)
+
+        self.imu_bg = np.zeros(3, dtype=np.float64)
+        self.imu_ba = np.zeros(3, dtype=np.float64)
+        self.R_imu_mount: np.ndarray | None = None
+
+        # 1. 构建双目相机模型 (若存在标定文件则加载真实标定参数，否则采用 640x480 标准初始内参)
+        if calib_json and os.path.exists(calib_json):
+            import json
+            self.camera = StereoCamera.from_calib_file(calib_json)
+            with open(calib_json, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if "imu_bg" in cfg:
+                self.imu_bg = np.asarray(cfg["imu_bg"], dtype=np.float64).reshape(3)
+            if "imu_ba" in cfg:
+                self.imu_ba = np.asarray(cfg["imu_ba"], dtype=np.float64).reshape(3)
+            if "R_imu_mount" in cfg:
+                self.R_imu_mount = np.asarray(cfg["R_imu_mount"], dtype=np.float64).reshape(3, 3)
+            elif "imu_mount_rpy_deg" in cfg:
+                self.R_imu_mount = WitMotionSerialIMU.euler_deg_to_R(
+                    np.asarray(cfg["imu_mount_rpy_deg"], dtype=np.float64)
+                )
+            self.calib_source = f"Loaded calibration JSON ({calib_json})"
+        else:
+            self.camera = StereoCamera(
+                fx=450.0,
+                fy=450.0,
+                cx=self.half_w * 0.5,
+                cy=self.height * 0.5,
+                baseline=0.060,
+                width=self.half_w,
+                height=self.height,
+                th_depth_factor=40.0,
+                fps=30.0,
+            )
+            self.calib_source = "Default 640x480 Stereo Intrinsics (b=6.0cm, uncalibrated)"
+
+        # 2. 启动串口 IMU (带竖立安装旋转矩阵补偿)
+        self.imu = WitMotionSerialIMU(port=imu_port, baud=imu_baud, R_mount=self.R_imu_mount)
+        self.imu_ok = self.imu.start()
+
+        # 3. 打开 USB 摄像头并自动检测双目 (1280x480) 或单目 (640x480)
+        backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(self.cam_id, backend)
+        if not self.cap.isOpened():
+            self.cap.release()
+            self.cap = cv2.VideoCapture(self.cam_id)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"无法打开摄像头 (cam_id={self.cam_id})")
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        if not self.is_monocular:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.concat_width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            ret_probe, frame_probe = self.cap.read()
+            if ret_probe and frame_probe is not None:
+                hp, wp = frame_probe.shape[:2]
+                if wp != self.concat_width or hp != self.height:
+                    # 该设备不支持 1280x480 左右拼接双目，自动切换为 640x480 单目+IMU模式
+                    self.is_monocular = True
+        if self.is_monocular:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.half_w)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+
+        # 预热排空摄像头首几帧缓存并等待首包 IMU 数据到达
+        for _ in range(5):
+            self.cap.read()
+        if self.imu_ok:
+            t_wait = time.perf_counter()
+            while self.imu.total_packets < 2 and (time.perf_counter() - t_wait) < 0.35:
+                time.sleep(0.01)
+
+        self._t0 = time.perf_counter()
+        self._last_ts = 0.0
+
+    def read_frame(self) -> tuple[np.ndarray, np.ndarray, float, list[ImuMeasurement], dict]:
+        """
+        读取一帧同步双目或单目灰度图像与帧间 IMU 数据包:
+        返回 (img_l_gray, img_r_gray, timestamp_sec, imu_measurements, imu_status_dict)
+        """
+        ret, frame = self.cap.read()
+        ts_perf = time.perf_counter()
+        if not ret or frame is None:
+            raise RuntimeError(f"从摄像头 (cam_id={self.cam_id}) 读取图像帧失败")
+
+        if self.is_monocular:
+            if frame.shape[1] != self.half_w or frame.shape[0] != self.height:
+                frame = cv2.resize(frame, (self.half_w, self.height))
+            img_l = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+            img_r = img_l.copy()
+        else:
+            if frame.shape[1] != self.concat_width or frame.shape[0] != self.height:
+                frame = cv2.resize(frame, (self.concat_width, self.height))
+            bgr_l = frame[:, : self.half_w]
+            bgr_r = frame[:, self.half_w :]
+            img_l = cv2.cvtColor(bgr_l, cv2.COLOR_BGR2GRAY) if bgr_l.ndim == 3 else bgr_l.copy()
+            img_r = cv2.cvtColor(bgr_r, cv2.COLOR_BGR2GRAY) if bgr_r.ndim == 3 else bgr_r.copy()
+
+        rel_ts = ts_perf - self._t0
+        prev_perf = self._t0 + self._last_ts if self._last_ts > 0.0 else (ts_perf - 0.033)
+        imu_raw = self.imu.get_measurements_between(prev_perf, ts_perf) if self.imu_ok else []
+        imu_batch = [
+            ImuMeasurement(
+                timestamp=max(0.0, m.timestamp - self._t0),
+                acc=m.acc - self.imu_ba,
+                gyro=m.gyro - self.imu_bg,
+            )
+            for m in imu_raw
+        ]
+        self._last_ts = rel_ts
+        return img_l, img_r, rel_ts, imu_batch, self.imu.get_status_snapshot()
+
+    def close(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+        self.imu.close()
+

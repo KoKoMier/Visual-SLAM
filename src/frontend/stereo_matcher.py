@@ -346,20 +346,34 @@ class StereoMatcher:
         if len(unmatched_1) == 0 or len(unmatched_2) == 0:
             return []
 
+        # 计算 kf1 光心 o1 在 kf2 像素平面上的对极点 (ex, ey)，对应 ORB-SLAM3 CheckDistEpipolarLine 极点退化剔除
+        o1_w = kf1.get_camera_center()
+        o1_c2 = T_2w.transform(o1_w)
+        has_epipole_in_kf2 = o1_c2[2] > 1e-4
+        if has_epipole_in_kf2:
+            uv_e2 = kf2.camera.project_mono(o1_c2)
+            ex, ey = float(uv_e2[0]), float(uv_e2[1])
+        else:
+            ex, ey = -1e6, -1e6
+
+        desc1_sub = kf1.descriptors[unmatched_1]
         desc2_sub = kf2.descriptors[unmatched_2]
+        # 一次性向量化计算 N1 x N2 汉明距离矩阵，省去 Python 逐点全量广播与完整排序开销
+        dist_mat = _POPCOUNT_TABLE[desc1_sub[:, None, :] ^ desc2_sub[None, :, :]].sum(axis=-1)
         used_2 = set()
         matches: list[tuple[int, int]] = []
 
-        for idx1 in unmatched_1:
-            d1 = kf1.descriptors[idx1]
+        for row_i, idx1 in enumerate(unmatched_1):
             lvl1 = int(kf1.kp_octaves[idx1])
             u1, v1 = float(kf1.kp_pts[idx1, 0]), float(kf1.kp_pts[idx1, 1])
             p1_h = np.array([u1, v1, 1.0], dtype=np.float64)
 
-            dists = descriptor_distance_batch(d1, desc2_sub)
-            sorted_order = np.argsort(dists)
+            dists = dist_mat[row_i]
+            k_top = min(5, len(dists))
+            cand_k = np.argpartition(dists, k_top - 1)[:k_top]
+            sorted_order = cand_k[np.argsort(dists[cand_k])]
 
-            for k in sorted_order[:5]:
+            for k in sorted_order:
                 dist = int(dists[k])
                 if dist > cls.TH_LOW:
                     break
@@ -370,8 +384,14 @@ class StereoMatcher:
                 if abs(lvl1 - lvl2) > 2:
                     continue
 
-                # 极线几何距离校验: p1^T * F_12 * p2 = 0
                 u2, v2 = float(kf2.kp_pts[idx2, 0]), float(kf2.kp_pts[idx2, 1])
+                # 对齐 ORB-SLAM3 ORBmatcher::SearchForTriangulation: 剔除距离对极点过近 (<10px * scale) 的退化射线对
+                if has_epipole_in_kf2 and kf2.u_right[idx2] < 0.0:
+                    dist_epipole_sq = (u2 - ex) ** 2 + (v2 - ey) ** 2
+                    if dist_epipole_sq < 100.0 * float(kf2.scale_factors[lvl2]):
+                        continue
+
+                # 极线几何距离校验: p1^T * F_12 * p2 = 0
                 l1 = F_12 @ np.array([u2, v2, 1.0], dtype=np.float64)
                 num = float(np.dot(p1_h, l1))
                 denom = l1[0] * l1[0] + l1[1] * l1[1]

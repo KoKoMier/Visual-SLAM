@@ -39,7 +39,7 @@ class Frame:
         "num_kps",
         "map_points", "outliers",
         "T_cw", "has_pose",
-        "v_w", "bg", "ba",
+        "v_w", "bg", "ba", "R_cw_imu_prior",
         "ref_kf",
         "scale_factors", "inv_scale_factors",
         "level_sigma2", "inv_level_sigma2",
@@ -107,6 +107,7 @@ class Frame:
         self.v_w: np.ndarray = np.zeros(3, dtype=np.float64)
         self.bg: np.ndarray = np.zeros(3, dtype=np.float64)
         self.ba: np.ndarray = np.zeros(3, dtype=np.float64)
+        self.R_cw_imu_prior: np.ndarray | None = None
         self.ref_kf: KeyFrame | None = None
 
         # 金字塔尺度因子与不确定度权重 (ORB-SLAM3 标准 8 层金字塔, 缩放比 1.2)

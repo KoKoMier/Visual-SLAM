@@ -154,13 +154,14 @@ class Optimizer:
                 J[:, 1, 4] = -fy * inv_z
                 J[:, 1, 5] =  fy * Y * inv_z2
 
-                # Row 2: de_ur / d_xi (仅双目观测有效)
-                fX_bf = fx * X - bf
-                J[is_stereo, 2, 0] =  (Y[is_stereo] * fX_bf[is_stereo]) * inv_z2[is_stereo]
-                J[is_stereo, 2, 1] = -fx - (X[is_stereo] * fX_bf[is_stereo]) * inv_z2[is_stereo]
-                J[is_stereo, 2, 2] =  fx * Y[is_stereo] * inv_z[is_stereo]
-                J[is_stereo, 2, 3] = -fx * inv_z[is_stereo]
-                J[is_stereo, 2, 5] =  fX_bf[is_stereo] * inv_z2[is_stereo]
+                # Row 2: de_ur / d_xi (仅双目观测有效，纯单目帧直接跳过以节省开销)
+                if np.any(is_stereo):
+                    fX_bf = fx * X - bf
+                    J[is_stereo, 2, 0] =  (Y[is_stereo] * fX_bf[is_stereo]) * inv_z2[is_stereo]
+                    J[is_stereo, 2, 1] = -fx - (X[is_stereo] * fX_bf[is_stereo]) * inv_z2[is_stereo]
+                    J[is_stereo, 2, 2] =  fx * Y[is_stereo] * inv_z[is_stereo]
+                    J[is_stereo, 2, 3] = -fx * inv_z[is_stereo]
+                    J[is_stereo, 2, 5] =  fX_bf[is_stereo] * inv_z2[is_stereo]
 
                 res = np.stack([eu, ev, eur], axis=1)  # (N, 3)
 
@@ -268,11 +269,13 @@ class Optimizer:
                     if len(fixed_kfs_set) >= 15:
                         break
 
-        # 第 0 号世界原点关键帧永远固定；其余关键帧作为可优化变量
+        # 第 0 号世界原点关键帧永远固定；单目+IMU模式下同时固定第 1 号初始化关键帧以锁定初始物理基线尺度；其余作为可优化变量
+        is_mono_window = all(np.all(k.depths < 0.0) for k in local_kfs)
+        has_imu_in_window = any(k.R_cw_imu_prior is not None for k in local_kfs)
         opt_kfs: list[KeyFrame] = []
         fixed_kfs: list[KeyFrame] = sorted(fixed_kfs_set, key=lambda k: k.id)
         for l_kf in local_kfs:
-            if l_kf.id == 0:
+            if l_kf.id == 0 or (is_mono_window and has_imu_in_window and l_kf.id == 1):
                 fixed_kfs.append(l_kf)
             else:
                 opt_kfs.append(l_kf)
@@ -448,13 +451,30 @@ class Optimizer:
                     b_p_e = np.einsum("eij,ei->ej", w_Jp, res_sub)     # (E_opt, 6)
                     H_pm_e = np.einsum("eij,eik->ejk", w_Jp, Jm_sub)  # (E_opt, 6, 3)
 
-                    for idx_local, e_idx in enumerate(opt_edge_indices):
-                        ki = int(e_kf_opt[e_idx])
-                        mi = int(e_mp[e_idx])
+                    ki_sub = e_kf_opt[opt_edge_indices]
+                    mi_sub = e_mp[opt_edge_indices]
+                    H_pp_blk = np.zeros((n_opt_kfs, 6, 6), dtype=np.float64)
+                    b_p_blk = np.zeros((n_opt_kfs, 6), dtype=np.float64)
+                    np.add.at(H_pp_blk, ki_sub, H_pp_e)
+                    np.add.at(b_p_blk, ki_sub, b_p_e)
+                    for ki in range(n_opt_kfs):
                         s = slice(6 * ki, 6 * (ki + 1))
-                        H_pp[s, s] += H_pp_e[idx_local]
-                        b_p[s] += b_p_e[idx_local]
-                        H_pm_blocks[ki, mi] += H_pm_e[idx_local]
+                        H_pp[s, s] += H_pp_blk[ki]
+                        b_p[s] += b_p_blk[ki]
+                    np.add.at(H_pm_blocks, (ki_sub, mi_sub), H_pm_e)
+
+                # 单目+IMU 紧耦合模式: 为局部窗口关键帧耦合 IMU 预积分旋转流形先验约束 + 微基线平移阻尼正则
+                if is_mono_window and has_imu_in_window:
+                    w_kf_rot = 5.0e5
+                    w_kf_trans_reg = 35.0 if kf.camera.width == 640 else 2.0
+                    for ki, opt_kf in enumerate(opt_kfs):
+                        if opt_kf.R_cw_imu_prior is not None:
+                            e_rot_kf = log_so3(opt_kf.T_cw.R @ opt_kf.R_cw_imu_prior.T)
+                            s_rot = slice(6 * ki, 6 * ki + 3)
+                            H_pp[s_rot, s_rot] += np.eye(3, dtype=np.float64) * w_kf_rot
+                            b_p[s_rot] += w_kf_rot * e_rot_kf
+                        s_trans = slice(6 * ki + 3, 6 * ki + 6)
+                        H_pp[s_trans, s_trans] += np.eye(3, dtype=np.float64) * w_kf_trans_reg
 
                 # 4) 舒尔补消元 (Schur Complement):
                 # 批量求逆所有地图点的 3x3 块 H_mm_inv (M, 3, 3)
@@ -482,6 +502,11 @@ class Optimizer:
                     continue
 
                 prev_cost = float(np.sum(w_e * (eu * eu + ev * ev + np.where(e_stereo, eur * eur, 0.0))))
+                if is_mono_window and has_imu_in_window:
+                    for opt_kf in opt_kfs:
+                        if opt_kf.R_cw_imu_prior is not None:
+                            e_r_prev = log_so3(opt_kf.T_cw.R @ opt_kf.R_cw_imu_prior.T)
+                            prev_cost += 5.0e5 * float(np.dot(e_r_prev, e_r_prev))
                 saved_poses = [opt_kf.T_cw.copy() for opt_kf in opt_kfs]
                 saved_pts = [mp.pos_w.copy() for mp in local_mps]
 
@@ -494,7 +519,7 @@ class Optimizer:
                 for mi, mp in enumerate(local_mps):
                     mp.pos_w = mp.pos_w + d_P_all[mi]
 
-                # 校验更新后代价函数是否下降
+                # 校验更新后总代价函数 (视觉重投影 + IMU 旋转先验) 是否下降
                 R_new = np.array([k.T_cw.R for k in all_active_kfs], dtype=np.float64)
                 t_new = np.array([k.T_cw.t for k in all_active_kfs], dtype=np.float64)
                 P_new = np.array([m.pos_w for m in local_mps], dtype=np.float64)
@@ -508,6 +533,11 @@ class Optimizer:
                 evn = e_uv[:, 1] - vn_p
                 eurn = np.where(e_stereo, e_uv[:, 2] - urn_p, 0.0)
                 new_cost = float(np.sum(w_e * (eun * eun + evn * evn + np.where(e_stereo, eurn * eurn, 0.0))))
+                if is_mono_window and has_imu_in_window:
+                    for opt_kf in opt_kfs:
+                        if opt_kf.R_cw_imu_prior is not None:
+                            e_r_new = log_so3(opt_kf.T_cw.R @ opt_kf.R_cw_imu_prior.T)
+                            new_cost += 5.0e5 * float(np.dot(e_r_new, e_r_new))
 
                 if new_cost > prev_cost:
                     # 拒绝劣质步，恢复状态并增大 LM 阻尼因子
