@@ -198,8 +198,10 @@ class MapPoint:
         更新地图点平均观测方向向量 normal 与金字塔尺度距离范围
         对应 ORB-SLAM3 MapPoint::UpdateNormalAndDepth()
         """
-        if self.is_bad or len(self.observations) == 0 or self.ref_kf is None:
+        if self.is_bad or len(self.observations) == 0:
             return
+        if self.ref_kf is None or self.ref_kf.is_bad or self.ref_kf not in self.observations:
+            self.ref_kf = next(iter(self.observations.keys()))
         normals = []
         for kf, _ in self.observations.items():
             if not kf.is_bad:
@@ -219,17 +221,18 @@ class MapPoint:
         dist = float(np.linalg.norm(self.pos_w - ref_center))
         ref_idx = self.observations.get(self.ref_kf, 0)
         level = int(self.ref_kf.kp_octaves[ref_idx]) if ref_idx < len(self.ref_kf.kp_octaves) else 0
-        scale_factor = self.ref_kf.scale_factors[level]
-        n_levels = len(self.ref_kf.scale_factors)
-        max_scale = self.ref_kf.scale_factors[-1]
+        scale_factor = float(self.ref_kf.scale_factors[level])
+        max_scale = float(self.ref_kf.scale_factors[-1])
 
-        self.max_distance = dist * scale_factor
-        self.min_distance = self.max_distance / max_scale
+        self.max_distance = max(0.1, dist * scale_factor)
+        self.min_distance = self.max_distance / max(1.0, max_scale)
 
     def predict_scale(self, current_dist, n_levels = 8, log_scale_factor = np.log(1.2)) :
         """根据当前距离预测特征点在图像金字塔中的最佳层级 (0 ~ n_levels-1)"""
-        if current_dist <= 1e-6 or self.max_distance <= 1e-6:
+        if current_dist <= 1e-6 or self.max_distance <= 1e-6 or not np.isfinite(self.max_distance):
             return 0
         ratio = self.max_distance / current_dist
+        if ratio <= 1.0:
+            return 0
         level = int(np.ceil(np.log(ratio) / log_scale_factor))
         return int(np.clip(level, 0, n_levels - 1))

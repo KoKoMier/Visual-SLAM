@@ -1144,7 +1144,7 @@ if __name__ == "__main__":
     parser.add_argument("--concat_width", type=int, default=1280, help="左右拼接图像总宽度 (默认 1280)")
     parser.add_argument("--height", type=int, default=480, help="图像高度 (默认 480)")
     parser.add_argument("--imu_port", type=str, default="COM3", help="IMU 串口号 (默认 COM3)")
-    parser.add_argument("--imu_baud", type=int, default=9600, help="IMU 串口波特率 (默认 9600)")
+    parser.add_argument("--imu_baud", type=int, default=115200, help="IMU 串口波特率 (默认 115200, 自动兼容 9600->115200 @ 200Hz)")
     parser.add_argument("--frames", type=int, default=60, help="实机在线标定采样帧数 (默认 60)")
     parser.add_argument("--baseline_mm", type=float, default=60.0, help="方式 B：双目左右镜头中心距毫米数 (默认 60.0 mm)")
     parser.add_argument("--show", action="store_true", help="方式 B：显示实时双目画面与两阶段标定提示窗口")

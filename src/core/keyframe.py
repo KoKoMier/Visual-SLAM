@@ -37,6 +37,7 @@ class KeyFrame:
         "u_right", "depths", "num_kps",
         "map_points",
         "T_cw", "v_w", "bg", "ba", "R_cw_imu_prior",
+        "prev_kf", "next_kf", "imu_preintegrated", "b_imu",
         "scale_factors", "inv_scale_factors",
         "level_sigma2", "inv_level_sigma2",
         "grid_element_width_inv", "grid_element_height_inv", "grid",
@@ -72,6 +73,14 @@ class KeyFrame:
         self.R_cw_imu_prior = (
             frame.R_cw_imu_prior.copy() if frame.R_cw_imu_prior is not None else None
         )
+        self.prev_kf = None
+        self.next_kf = None
+        self.imu_preintegrated = (
+            frame.imu_preintegrated.copy()
+            if getattr(frame, "imu_preintegrated", None) is not None
+            else None
+        )
+        self.b_imu = False
 
         self.scale_factors = frame.scale_factors.copy()
         self.inv_scale_factors = frame.inv_scale_factors.copy()
@@ -112,6 +121,41 @@ class KeyFrame:
 
     def get_camera_center(self) :
         return -(self.T_cw.R.T @ self.T_cw.t)
+
+    def get_imu_rotation(self) :
+        """返回 IMU Body 在世界系下的旋转 R_wb = R_wc * R_cb (对应 ORB-SLAM3 KeyFrame::GetImuRotation)"""
+        R_bc = self.camera.T_b_c1[:3, :3]
+        R_cb = R_bc.T
+        return self.T_cw.R.T @ R_cb
+
+    def get_imu_position(self) :
+        """返回 IMU Body 在世界系下的位置 t_wb = R_wc * t_cb + t_wc (对应 ORB-SLAM3 KeyFrame::GetImuPosition)"""
+        R_bc = self.camera.T_b_c1[:3, :3]
+        t_bc = self.camera.T_b_c1[:3, 3]
+        t_cb = -(R_bc.T @ t_bc)
+        R_wc = self.T_cw.R.T
+        t_wc = -(R_wc @ self.T_cw.t)
+        return R_wc @ t_cb + t_wc
+
+    def set_imu_pose_velocity(self, R_wb, t_wb, v_wb) :
+        """由 IMU Body 位姿 (R_wb, t_wb) 与速度 v_wb 更新相机位姿 T_cw"""
+        R_bc = self.camera.T_b_c1[:3, :3]
+        t_bc = self.camera.T_b_c1[:3, 3]
+        R_cb = R_bc.T
+        t_cb = -(R_cb @ t_bc)
+        R_bw = R_wb.T
+        t_bw = -(R_bw @ t_wb)
+        R_cw = R_cb @ R_bw
+        t_cw = R_cb @ t_bw + t_cb
+        self.set_pose(SE3(R_cw, t_cw))
+        self.v_w = np.asarray(v_wb, dtype=np.float64).reshape(3).copy()
+
+    def set_new_bias(self, bg_new, ba_new) :
+        """更新陀螺仪与加速度计零偏 (对应 ORB-SLAM3 KeyFrame::SetNewBias)"""
+        self.bg = np.asarray(bg_new, dtype=np.float64).reshape(3).copy()
+        self.ba = np.asarray(ba_new, dtype=np.float64).reshape(3).copy()
+        if self.imu_preintegrated is not None:
+            self.imu_preintegrated.set_new_bias(self.bg, self.ba)
 
     def add_mappoint(self, mp, idx) :
         self.map_points[idx] = mp

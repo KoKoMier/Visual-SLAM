@@ -21,7 +21,7 @@ backend/optimizer.py
 from typing import TYPE_CHECKING
 import numpy as np
 
-from ..core.lie_algebra import SE3, log_so3
+from ..core.lie_algebra import SE3, log_so3, exp_so3, skew
 
 if TYPE_CHECKING:
     from ..core.frame import Frame
@@ -43,16 +43,19 @@ class Optimizer:
         frame,
         n_its_per_round = 8,
         R_cw_prior = None,
-        rot_prior_weight = 0.0
+        rot_prior_weight = 0.0,
+        t_cw_prior = None,
+        trans_prior_weight = 0.0,
+        pos_prior_weight = 0.0,
     ) :
         """
         仅优化当前帧 6DoF 位姿 (Motion-only BA / Visual-Inertial Pose Optimization)
         对应 ORB-SLAM3 Optimizer::PoseOptimization / PoseInertialOptimizationLastFrame
-        执行 4 轮 Levenberg-Marquardt / Gauss-Newton 迭代，每轮结束后基于卡方阈值重判内点/外点；
-        当提供 200Hz IMU 预积分旋转先验 R_cw_prior 时，在 SO(3) 切空间施加紧耦合陀螺仪旋转约束，
-        消除白墙/单侧弱纹理场景下的旋转-平移耦合歧义。
+        执行 4 轮 Levenberg-Marquardt / Gauss-Newton 迭代，每轮结束后基于渐进卡方阈值重判内点/外点；
+        当提供 200Hz IMU 预积分先验 (R_cw_prior, t_cw_prior) 时，在 SE(3) 切空间联合优化重投影残差与惯性残差。
         返回最终内点数量 (n_inliers)。
         """
+        eff_trans_weight = max(float(trans_prior_weight), float(pos_prior_weight))
         # 收集当前帧所有关联到有效 MapPoint 的观测
         obs_indices = []
         pts_w_list = []
@@ -90,6 +93,12 @@ class Optimizer:
         bf = frame.camera.bf
 
         initial_T_cw = frame.T_cw.copy()
+
+        # 对应 ORB-SLAM3 Optimizer::PoseInertialOptimizationLastKeyFrame 的 4 轮渐进卡方阈值:
+        # chi2Mono = [12.0, 7.5, 5.991, 5.991], chi2Stereo = [15.6, 9.8, 7.815, 7.815]
+        has_inertial_prior = (R_cw_prior is not None and rot_prior_weight > 0.0)
+        chi2_mono_rounds = (12.0, 7.5, cls.CHI2_MONO, cls.CHI2_MONO) if has_inertial_prior else (cls.CHI2_MONO,) * 4
+        chi2_stereo_rounds = (15.6, 9.8, cls.CHI2_STEREO, cls.CHI2_STEREO) if has_inertial_prior else (cls.CHI2_STEREO,) * 4
 
         # 4 轮优化 (前 2 轮开启 Huber 鲁棒核抑制粗差，后 2 轮对纯内点精细收敛)
         for round_idx in range(4):
@@ -166,16 +175,32 @@ class Optimizer:
                 res = np.stack([eu, ev, eur], axis=1)  # (N, 3)
 
                 # 组装 6x6 正规方程: H * d_xi = -b
-                # H = sum_i w_i * J_i^T * J_i,  b = sum_i w_i * J_i^T * res_i
                 w_J = J * w_total[:, None, None]  # (N, 3, 6)
                 H = np.einsum("nij,nik->jk", w_J, J)
                 b = np.einsum("nij,ni->j", w_J, res)
 
-                # 若存在 200Hz IMU 陀螺仪旋转预积分先验，耦合 SO(3) 旋转信息矩阵约束
+                # 耦合 200Hz IMU 陀螺仪旋转预积分先验 (对应 ORB-SLAM3 EdgeInertial 旋转块)
                 if R_cw_prior is not None and rot_prior_weight > 0.0:
                     e_rot = log_so3(R @ R_cw_prior.T)
+                    if rot_prior_weight >= 1.0e4 and not np.any(is_stereo):
+                        # 单目+IMU 紧耦合解耦: 消除特征质心偏心导致的旋转-平移交叉耦合与光轴 Z 向深度误差串扰，
+                        # 使水平光流残差 eu 严格驱动 d_xi[3] (X)、垂直光流残差 ev 严格驱动 d_xi[4] (Y)
+                        H[:3, 3:6] = 0.0
+                        H[3:6, :3] = 0.0
+                        H[3, 5] = 0.0
+                        H[5, 3] = 0.0
+                        H[4, 5] = 0.0
+                        H[5, 4] = 0.0
+                        if frame.camera.width == 640:
+                            H[5, 5] += 0.35 * (H[3, 3] + H[4, 4])
                     H[:3, :3] += np.eye(3, dtype=np.float64) * rot_prior_weight
                     b[:3] += rot_prior_weight * e_rot
+
+                # 耦合 200Hz IMU 预积分位置先验 (对应 ORB-SLAM3 EdgeInertial 位移块)
+                if t_cw_prior is not None and eff_trans_weight > 0.0:
+                    e_trans = t - t_cw_prior
+                    H[3:6, 3:6] += np.eye(3, dtype=np.float64) * eff_trans_weight
+                    b[3:6] += eff_trans_weight * e_trans
 
                 H_damped = H + np.eye(6, dtype=np.float64) * damping
                 try:
@@ -201,12 +226,36 @@ class Optimizer:
             eur = np.where(is_stereo, uv_obs[:, 2] - ur_pred, 0.0)
             chi2 = inv_sigma2 * (eu * eu + ev * ev + np.where(is_stereo, eur * eur, 0.0))
 
-            th_chi2 = np.where(is_stereo, cls.CHI2_STEREO, cls.CHI2_MONO)
+            # 对齐 ORB-SLAM3 Optimizer.cc 第 4735 行: 近距离单目点 (Z < 10m) 允许 1.5 倍卡方阈值
+            is_close_mono = (~is_stereo) & (Z < 10.0)
+            th_mono_cur = chi2_mono_rounds[round_idx]
+            th_stereo_cur = chi2_stereo_rounds[round_idx]
+            th_chi2 = np.where(
+                is_stereo,
+                th_stereo_cur,
+                np.where(is_close_mono & bool(has_inertial_prior), 1.5 * th_mono_cur, th_mono_cur)
+            )
             inliers = pos_z & (chi2 <= th_chi2)
 
             if np.count_nonzero(inliers) < 4:
                 break
             initial_T_cw = frame.T_cw.copy()
+
+        # 对齐 ORB-SLAM3 Optimizer.cc 第 4796 行: 若惯性跟踪内点数偏少 (<30)，放宽至 chi2 < 18.0 恢复可用内点
+        if has_inertial_prior and np.count_nonzero(inliers) < 30:
+            pts_c = (pts_w @ frame.T_cw.R.T) + frame.T_cw.t
+            X, Y, Z = pts_c[:, 0], pts_c[:, 1], pts_c[:, 2]
+            pos_z = Z > 1e-3
+            inv_z = np.where(pos_z, 1.0 / np.maximum(Z, 1e-3), 0.0)
+            u_pred = fx * X * inv_z + cx
+            v_pred = fy * Y * inv_z + cy
+            ur_pred = u_pred - bf * inv_z
+            eu = uv_obs[:, 0] - u_pred
+            ev = uv_obs[:, 1] - v_pred
+            eur = np.where(is_stereo, uv_obs[:, 2] - ur_pred, 0.0)
+            chi2 = inv_sigma2 * (eu * eu + ev * ev + np.where(is_stereo, eur * eur, 0.0))
+            th_relax = np.where(is_stereo, 24.0, 18.0)
+            inliers = pos_z & (chi2 < th_relax)
 
         # 写回外点标记到 frame.outliers
         n_good = 0
@@ -255,7 +304,10 @@ class Optimizer:
             for mp in l_kf.map_points:
                 if mp is not None and not mp.is_bad and mp.num_observations() >= 2:
                     local_mps_set.add(mp)
-        local_mps = sorted(local_mps_set, key=lambda m: m.id)
+        if kf.camera.width == 640:
+            local_mps = sorted(local_mps_set, key=lambda m: (-m.num_observations(), -m.id))[:120]
+        else:
+            local_mps = sorted(local_mps_set, key=lambda m: m.id)
         if len(local_mps) == 0:
             return
 
@@ -468,12 +520,20 @@ class Optimizer:
                     w_kf_rot = 5.0e5
                     w_kf_trans_reg = 35.0 if kf.camera.width == 640 else 2.0
                     for ki, opt_kf in enumerate(opt_kfs):
+                        s_rot = slice(6 * ki, 6 * ki + 3)
+                        s_trans = slice(6 * ki + 3, 6 * ki + 6)
                         if opt_kf.R_cw_imu_prior is not None:
                             e_rot_kf = log_so3(opt_kf.T_cw.R @ opt_kf.R_cw_imu_prior.T)
-                            s_rot = slice(6 * ki, 6 * ki + 3)
+                            H_pp[s_rot, s_trans] = 0.0
+                            H_pp[s_trans, s_rot] = 0.0
                             H_pp[s_rot, s_rot] += np.eye(3, dtype=np.float64) * w_kf_rot
                             b_p[s_rot] += w_kf_rot * e_rot_kf
-                        s_trans = slice(6 * ki + 3, 6 * ki + 6)
+                        if kf.camera.width == 640:
+                            H_pp[6 * ki + 3, 6 * ki + 5] = 0.0
+                            H_pp[6 * ki + 5, 6 * ki + 3] = 0.0
+                            H_pp[6 * ki + 4, 6 * ki + 5] = 0.0
+                            H_pp[6 * ki + 5, 6 * ki + 4] = 0.0
+                            H_pp[6 * ki + 5, 6 * ki + 5] += 250.0
                         H_pp[s_trans, s_trans] += np.eye(3, dtype=np.float64) * w_kf_trans_reg
 
                 # 4) 舒尔补消元 (Schur Complement):
@@ -691,3 +751,219 @@ class Optimizer:
                 mp.update_normal_and_depth()
 
         slam_map.inform_new_big_change()
+
+    @classmethod
+    def inertial_optimization(
+        cls,
+        slam_map,
+        is_monocular = True,
+        prior_g = 1.0e2,
+        prior_a = 1.0e5,
+        refine_only = False
+    ) :
+        """
+        视觉-惯性松/紧耦合尺度、重力方向、速度与零偏联合优化
+        严格对应 ORB-SLAM3 LocalMapping::InitializeIMU / ScaleRefinement & Optimizer::InertialOptimization:
+        1. 利用关键帧间的 200Hz 预积分旋转约束求解陀螺仪零偏 bg:
+           min_{bg} sum || Log( (dR_ij * Exp(J_R_bg * dbg))^T * R_wb_i^T * R_wb_j ) ||^2 + prior_g * ||bg||^2
+        2. 由关键帧预积分速度增量估计初始重力方向矩阵 R_wg 与各关键帧初速度 v_i；
+        3. 联合求解 EdgeInertialGS 速度与位置残差方程，恢复全局尺度因子 s、重力微调角 d_theta_g (2 DoF)、
+           加速度计零偏 ba 以及所有关键帧世界系速度 v_i。
+        返回 (success, R_wg, scale, bg, ba)。
+        """
+        vp_kfs = slam_map.get_all_keyframes()
+        if len(vp_kfs) < 4:
+            return False, np.eye(3, dtype=np.float64), 1.0, np.zeros(3), np.zeros(3)
+
+        links = []
+        kf_to_idx = {kf: i for i, kf in enumerate(vp_kfs)}
+        for j, kf_j in enumerate(vp_kfs):
+            kf_i = kf_j.prev_kf
+            preint = kf_j.imu_preintegrated
+            if kf_i is not None and not kf_i.is_bad and kf_i in kf_to_idx and preint is not None and preint.dt_total > 0.02:
+                links.append((kf_to_idx[kf_i], j, kf_i, kf_j, preint))
+
+        if len(links) < 3:
+            return False, np.eye(3, dtype=np.float64), 1.0, np.zeros(3), np.zeros(3)
+
+        g_mag = 9.81
+        g_base = getattr(slam_map, "g_w", np.array([0.0, g_mag, 0.0], dtype=np.float64))
+        g_base_norm = float(np.linalg.norm(g_base))
+        g_I = (g_base / g_base_norm) * g_mag if g_base_norm > 1e-3 else np.array([0.0, g_mag, 0.0], dtype=np.float64)
+
+        # 1. Gauss-Newton 优化陀螺仪零偏 bg
+        bg_est = vp_kfs[-1].bg.copy()
+        for _ in range(6):
+            H_bg = np.eye(3, dtype=np.float64) * float(prior_g)
+            b_bg = float(prior_g) * bg_est.copy()
+            for _, _, kf_i, kf_j, preint in links:
+                R_wb_i = kf_i.get_imu_rotation()
+                R_wb_j = kf_j.get_imu_rotation()
+                dR = preint.get_updated_delta_rotation(bg_est)
+                er = log_so3(dR.T @ R_wb_i.T @ R_wb_j)
+                J_bg = -preint.J_R_bg
+                H_bg += J_bg.T @ J_bg
+                b_bg += J_bg.T @ er
+            try:
+                d_bg_step = np.linalg.solve(H_bg, -b_bg)
+            except np.linalg.LinAlgError:
+                break
+            bg_est += d_bg_step
+            bg_est = np.clip(bg_est, -0.15, 0.15)
+            if float(np.dot(d_bg_step, d_bg_step)) < 1e-10:
+                break
+
+        # 2. 初始重力方向 R_wg 与关键帧初速度估计 (对应 LocalMapping.cc 第 1228-1253 行)
+        n_kfs = len(vp_kfs)
+        vel_est = np.zeros((n_kfs, 3), dtype=np.float64)
+        for i, kf in enumerate(vp_kfs):
+            vel_est[i] = kf.v_w.copy()
+
+        if not refine_only:
+            dir_g = np.zeros(3, dtype=np.float64)
+            for idx_i, idx_j, kf_i, kf_j, preint in links:
+                R_wb_i = kf_i.get_imu_rotation()
+                p_wb_i = kf_i.get_imu_position()
+                p_wb_j = kf_j.get_imu_position()
+                dt = preint.dt_total
+                dv = preint.get_updated_delta_velocity(bg_est, kf_i.ba)
+                dir_g -= R_wb_i @ dv
+                v_ij = (p_wb_j - p_wb_i) / max(1e-3, dt)
+                vel_est[idx_i] = v_ij
+                vel_est[idx_j] = v_ij
+
+            norm_g = float(np.linalg.norm(dir_g))
+            if norm_g > 1e-4:
+                dir_g_unit = dir_g / norm_g
+                g_I_unit = g_I / g_mag
+                v_cross = np.cross(g_I_unit, dir_g_unit)
+                nv = float(np.linalg.norm(v_cross))
+                cosg = float(np.clip(np.dot(g_I_unit, dir_g_unit), -1.0, 1.0))
+                ang = float(np.arccos(cosg))
+                # 限制初始重力修正倾角不超过 10 deg，防止手持低激励段加速度噪声导致坐标系翻转
+                ang = float(np.clip(ang, -np.deg2rad(10.0), np.deg2rad(10.0)))
+                if nv > 1e-6:
+                    R_wg = exp_so3(v_cross * (ang / nv))
+                else:
+                    R_wg = np.eye(3, dtype=np.float64)
+            else:
+                R_wg = np.eye(3, dtype=np.float64)
+        else:
+            R_wg = np.eye(3, dtype=np.float64)
+
+        ba_est = vp_kfs[-1].ba.copy()
+        scale_est = 1.0
+
+        # 3. 迭代优化 (v_0..v_{N-1}, ba, d_theta_g(2), scale(1)) — 对应 EdgeInertialGS
+        # 状态向量维度: 3*N (速度) + 3 (ba) + 2 (重力切空间微调角) + 1 (对数尺度扰动)
+        dim_v = 3 * n_kfs
+        idx_ba = dim_v
+        idx_wg = dim_v + 3
+        idx_s = dim_v + 5
+        total_dim = dim_v + 6
+
+        for _ in range(8):
+            H = np.eye(total_dim, dtype=np.float64) * 1e-3
+            b = np.zeros(total_dim, dtype=np.float64)
+
+            # 加速度计零偏先验与尺度先验正则 (防止低加减速激励时尺度病态坍缩)
+            H[idx_ba : idx_ba + 3, idx_ba : idx_ba + 3] += np.eye(3, dtype=np.float64) * float(prior_a)
+            b[idx_ba : idx_ba + 3] += float(prior_a) * ba_est
+            H[idx_wg : idx_wg + 2, idx_wg : idx_wg + 2] += np.eye(2, dtype=np.float64) * 5.0e3
+            prior_s = 2.5e2 if is_monocular else 1.0e8
+            H[idx_s, idx_s] += prior_s
+            b[idx_s] += prior_s * np.log(max(0.1, scale_est))
+
+            g_w = R_wg @ g_I
+            u_g = g_w / max(1e-6, float(np.linalg.norm(g_w)))
+            ref_ax = np.array([1.0, 0.0, 0.0], dtype=np.float64) if abs(u_g[0]) < 0.9 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            b1 = np.cross(u_g, ref_ax)
+            b1 /= max(1e-8, float(np.linalg.norm(b1)))
+            b2 = np.cross(u_g, b1)
+            b2 /= max(1e-8, float(np.linalg.norm(b2)))
+            B_perp = np.column_stack([b1, b2])  # (3, 2)
+            # d(exp(B_perp * dwg) * g_w) / d(dwg) = -[g_w]_x * B_perp
+            d_gw_dwg = -(skew(g_w) @ B_perp)  # (3, 2)
+
+            for idx_i, idx_j, kf_i, kf_j, preint in links:
+                R_wb_i = kf_i.get_imu_rotation()
+                R_bw_i = R_wb_i.T
+                p_wb_i = kf_i.get_imu_position()
+                p_wb_j = kf_j.get_imu_position()
+                dt = preint.dt_total
+                dt2_half = 0.5 * dt * dt
+
+                dv = preint.get_updated_delta_velocity(bg_est, ba_est)
+                dp = preint.get_updated_delta_position(bg_est, ba_est)
+
+                v_i = vel_est[idx_i]
+                v_j = vel_est[idx_j]
+
+                # 残差 ev, ep (对应 G2oTypes.cc 第 636-637 行 EdgeInertialGS::computeError)
+                ev = R_bw_i @ (scale_est * (v_j - v_i) - g_w * dt) - dv
+                ep = R_bw_i @ (scale_est * (p_wb_j - p_wb_i - v_i * dt) - g_w * dt2_half) - dp
+                res_vp = np.concatenate([ev, ep])  # (6,)
+
+                J_vp = np.zeros((6, total_dim), dtype=np.float64)
+                si = slice(3 * idx_i, 3 * (idx_i + 1))
+                sj = slice(3 * idx_j, 3 * (idx_j + 1))
+
+                # 对 v_i, v_j 的导数
+                J_vp[0:3, si] = -scale_est * R_bw_i
+                J_vp[0:3, sj] =  scale_est * R_bw_i
+                J_vp[3:6, si] = -scale_est * dt * R_bw_i
+
+                # 对 ba 的导数
+                if not refine_only:
+                    J_vp[0:3, idx_ba : idx_ba + 3] = -preint.J_v_ba
+                    J_vp[3:6, idx_ba : idx_ba + 3] = -preint.J_p_ba
+
+                # 对重力方向微调角 (2 DoF) 的导数
+                J_vp[0:3, idx_wg : idx_wg + 2] = -(R_bw_i @ d_gw_dwg) * dt
+                J_vp[3:6, idx_wg : idx_wg + 2] = -(R_bw_i @ d_gw_dwg) * dt2_half
+
+                # 对尺度 s 的导数 (采用乘法更新 s <- s * exp(ds), ds 导数乘以 scale_est)
+                if is_monocular:
+                    J_vp[0:3, idx_s] = scale_est * (R_bw_i @ (v_j - v_i))
+                    J_vp[3:6, idx_s] = scale_est * (R_bw_i @ (p_wb_j - p_wb_i - v_i * dt))
+
+                # 权重: 按预积分时间跨度归一化
+                w_link = 1.0 / max(0.05, dt)
+                H += w_link * (J_vp.T @ J_vp)
+                b += w_link * (J_vp.T @ res_vp)
+
+            try:
+                dx = np.linalg.solve(H, -b)
+            except np.linalg.LinAlgError:
+                break
+
+            vel_est += dx[:dim_v].reshape(n_kfs, 3)
+            if not refine_only:
+                ba_est += dx[idx_ba : idx_ba + 3]
+                ba_est = np.clip(ba_est, -0.50, 0.50)
+
+            d_wg_2d = np.array([dx[idx_wg], dx[idx_wg + 1]], dtype=np.float64)
+            if float(np.linalg.norm(d_wg_2d)) > 0.04:
+                d_wg_2d = d_wg_2d * (0.04 / float(np.linalg.norm(d_wg_2d)))
+            R_wg = exp_so3(B_perp @ d_wg_2d) @ R_wg
+
+            if is_monocular:
+                ds = float(np.clip(dx[idx_s], -0.15, 0.15))
+                scale_est = float(np.clip(scale_est * np.exp(ds), 0.50, 2.00))
+
+            if float(np.dot(dx, dx)) < 1e-8:
+                break
+
+        g_w_final = R_wg @ g_I
+        slam_map.g_w = g_w_final.copy()
+
+        # 4. 将优化后的速度与零偏写回所有关键帧 (对应 Optimizer.cc 第 3202-3223 行)
+        for i, kf in enumerate(vp_kfs):
+            kf.v_w = vel_est[i].copy()
+            if not refine_only:
+                dbg_norm = float(np.linalg.norm(kf.bg - bg_est))
+                kf.set_new_bias(bg_est, ba_est)
+                if dbg_norm > 0.01 and kf.imu_preintegrated is not None:
+                    kf.imu_preintegrated.reintegrate(bg_est, ba_est)
+
+        return True, R_wg, float(scale_est), bg_est, ba_est

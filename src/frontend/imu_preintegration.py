@@ -149,6 +149,57 @@ class ImuPreintegrator:
         self.dR = self.dR @ dR_step
         self.dt_total += dt
 
+    def copy(self) :
+        """深拷贝当前预积分器状态 (对应 ORB-SLAM3 new IMU::Preintegrated(pInt))"""
+        clone = ImuPreintegrator(bg=self.bg, ba=self.ba)
+        clone.d_bg = self.d_bg.copy()
+        clone.d_ba = self.d_ba.copy()
+        clone.dR = self.dR.copy()
+        clone.dv = self.dv.copy()
+        clone.dp = self.dp.copy()
+        clone.dt_total = float(self.dt_total)
+        clone.J_R_bg = self.J_R_bg.copy()
+        clone.J_v_bg = self.J_v_bg.copy()
+        clone.J_v_ba = self.J_v_ba.copy()
+        clone.J_p_bg = self.J_p_bg.copy()
+        clone.J_p_ba = self.J_p_ba.copy()
+        clone.cov = self.cov.copy()
+        clone.noise_gyro_cov = self.noise_gyro_cov.copy()
+        clone.noise_acc_cov = self.noise_acc_cov.copy()
+        clone.measurements = [(a.copy(), g.copy(), float(dt)) for a, g, dt in self.measurements]
+        return clone
+
+    def set_new_bias(self, bg_new, ba_new) :
+        """设置新的零偏并更新 delta_bias (对应 ORB-SLAM3 Preintegrated::SetNewBias)"""
+        bg_v = np.asarray(bg_new, dtype=np.float64).reshape(3)
+        ba_v = np.asarray(ba_new, dtype=np.float64).reshape(3)
+        self.d_bg = bg_v - self.bg
+        self.d_ba = ba_v - self.ba
+
+    def reintegrate(self, bg_new = None, ba_new = None) :
+        """当零偏更新幅度较大时重新积分缓存的原始测量 (对应 ORB-SLAM3 Preintegrated::Reintegrate)"""
+        saved = list(self.measurements)
+        new_bg = self.bg + self.d_bg if bg_new is None else np.asarray(bg_new, dtype=np.float64).reshape(3)
+        new_ba = self.ba + self.d_ba if ba_new is None else np.asarray(ba_new, dtype=np.float64).reshape(3)
+        self.reset(bg=new_bg, ba=new_ba)
+        for acc_v, gyro_v, dt in saved:
+            self.integrate_new_measurement(acc_v, gyro_v, dt)
+
+    def merge_previous(self, prev_preint) :
+        """
+        关键帧剔除时将前一关键帧的预积分段合并至当前预积分器
+        对应 ORB-SLAM3 Preintegrated::MergePrevious(IMU::Preintegrated* pPrev)
+        """
+        if prev_preint is None:
+            return
+        saved_curr = list(self.measurements)
+        saved_prev = list(prev_preint.measurements)
+        self.reset(bg=prev_preint.bg, ba=prev_preint.ba)
+        for acc_v, gyro_v, dt in saved_prev:
+            self.integrate_new_measurement(acc_v, gyro_v, dt)
+        for acc_v, gyro_v, dt in saved_curr:
+            self.integrate_new_measurement(acc_v, gyro_v, dt)
+
     def get_updated_delta_rotation(self, bg_new = None) :
         """零偏变化后的一阶修正旋转: dR_updated = dR * Exp(J_R_bg * delta_bg)"""
         dbg = self.d_bg if bg_new is None else (np.asarray(bg_new, dtype=np.float64).reshape(3) - self.bg)

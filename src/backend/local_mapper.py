@@ -61,9 +61,10 @@ class LocalMapper:
         self.search_in_neighbors(curr_kf)
 
         # 6. 当地图中关键帧数 > 2 时执行稀疏舒尔补 Local BA，并同步单帧双目点世界坐标
+        is_mono_kf = bool(curr_kf.num_kps > 0 and np.all(curr_kf.depths < 0.0))
+        is_live_mono = bool(is_mono_kf and curr_kf.camera.width == 640)
         if self.slam_map.num_keyframes() > 2:
             T_cw_before = curr_kf.T_cw.copy()
-            is_live_mono = bool(curr_kf.camera.width == 640 and curr_kf.num_kps > 0 and np.all(curr_kf.depths < 0.0))
             run_ba = True
             if is_live_mono:
                 p_curr = curr_kf.get_camera_center()
@@ -72,7 +73,7 @@ class LocalMapper:
                     (float(np.linalg.norm(p_curr - k.get_camera_center())) for k in neigh_kfs if not k.is_bad),
                     default=0.0,
                 )
-                if max_base < 0.020:
+                if max_base < 0.025:
                     run_ba = False
             if run_ba:
                 ba_kfs = 3 if is_live_mono else self.max_local_kfs
@@ -84,6 +85,34 @@ class LocalMapper:
                 for mp in curr_kf.map_points:
                     if mp is not None and not mp.is_bad and mp.num_observations() == 1:
                         mp.pos_w = T_delta_w.transform(mp.pos_w)
+
+        # 6b. 视觉-惯性初始化与尺度精修 (对应 ORB-SLAM3 LocalMapping::InitializeIMU & ScaleRefinement)
+        if curr_kf.imu_preintegrated is not None:
+            n_kfs_map = self.slam_map.num_keyframes()
+            if not self.slam_map.is_imu_initialized() and (n_kfs_map >= 5 or curr_kf.id >= 5):
+                ok_imu, _, scale_imu, _, _ = Optimizer.inertial_optimization(
+                    self.slam_map, is_monocular=is_mono_kf, prior_g=1.0e2, prior_a=1.0e5, refine_only=False
+                )
+                if ok_imu:
+                    if is_mono_kf and not is_live_mono and abs(scale_imu - 1.0) > 0.01:
+                        self.slam_map.apply_scaled_rotation(np.eye(3, dtype=np.float64), scale_imu, b_scaled_vel=True)
+                    self.slam_map.set_imu_initialized()
+            elif self.slam_map.is_imu_initialized() and not self.slam_map.is_inertial_ba1() and (n_kfs_map >= 10 or curr_kf.id >= 10):
+                ok_imu, _, scale_imu, _, _ = Optimizer.inertial_optimization(
+                    self.slam_map, is_monocular=is_mono_kf, prior_g=1.0, prior_a=1.0e5, refine_only=False
+                )
+                if ok_imu:
+                    if is_mono_kf and not is_live_mono and abs(scale_imu - 1.0) > 0.01:
+                        self.slam_map.apply_scaled_rotation(np.eye(3, dtype=np.float64), scale_imu, b_scaled_vel=True)
+                    self.slam_map.set_inertial_ba1()
+            elif self.slam_map.is_inertial_ba1() and not self.slam_map.is_inertial_ba2() and (n_kfs_map >= 20 or curr_kf.id >= 18):
+                ok_imu, _, scale_imu, _, _ = Optimizer.inertial_optimization(
+                    self.slam_map, is_monocular=is_mono_kf, prior_g=0.0, prior_a=0.0, refine_only=True
+                )
+                if ok_imu:
+                    if is_mono_kf and not is_live_mono and abs(scale_imu - 1.0) > 0.01:
+                        self.slam_map.apply_scaled_rotation(np.eye(3, dtype=np.float64), scale_imu, b_scaled_vel=True)
+                    self.slam_map.set_inertial_ba2()
 
         # 7. 剔除冗余关键帧 (控制 RK3566 内存与后端规模)
         self.keyframe_culling(curr_kf)
@@ -140,10 +169,10 @@ class LocalMapper:
         A. 与前 10 个共视关键帧进行极线匹配 + 双视图线性三角化 (恢复远点与未匹配点)
         B. 补充当前关键帧中具有高置信度双目深度但尚未生成地图点的特征点
         """
-        # Part A: 共视关键帧三角化 (实机640单目取前 1 个以保证极速建图，数据集单目取前 8 个，双目取前 5 个)
+        # Part A: 共视关键帧三角化 (遵循 ORB-SLAM3: 单目取前 8 个，实机 640 单目取前 2 个，双目取前 5 个)
         is_mono_kf = bool(curr_kf.num_kps > 0 and np.all(curr_kf.depths < 0.0))
         is_live_mono = bool(is_mono_kf and curr_kf.camera.width == 640)
-        n_cov_tri = 1 if is_live_mono else (8 if is_mono_kf else 5)
+        n_cov_tri = 2 if is_live_mono else (8 if is_mono_kf else 5)
         neigh_kfs = curr_kf.get_best_covisibility_keyframes(n_cov_tri)
         T_1w = curr_kf.T_cw
         P1 = curr_kf.camera.K @ np.hstack([T_1w.R, T_1w.t.reshape(3, 1)])
@@ -214,8 +243,8 @@ class LocalMapper:
                 # 1. 正深度与合理物理范围检查
                 p_c1 = T_1w.transform(pos_w)
                 p_c2 = T_2w.transform(pos_w)
-                min_z = 0.08 if is_mono_kf else 0.60
-                max_z = 30.0 if is_mono_kf else 15.0
+                min_z = 0.15 if is_live_mono else (0.08 if is_mono_kf else 0.60)
+                max_z = 15.0 if is_live_mono else (30.0 if is_mono_kf else 15.0)
                 if not (min_z < p_c1[2] < max_z and min_z < p_c2[2] < max_z):
                     continue
 
@@ -256,8 +285,7 @@ class LocalMapper:
                 self.slam_map.add_mappoint(mp)
                 self.recent_added_mappoints.append(mp)
 
-        # Part B: 实机桌面单目+IMU模式 (640x480) 下，若相机发生纯旋转/微基线平移导致 DLT 无法三角化新视场特征点，
-        # 利用当前局部深度中位数对新视场内未匹配的高质量特征点补充生成惯性深度锚点，防止大幅度转头时 Inliers 跌零
+        # Part B: 当单目关键帧进入新视场或微基线移动导致有效三角化点偏少 (< 110) 时，用局部中位深度补充地图点以维持充足内点
         if is_mono_kf and curr_kf.camera.width == 640 and curr_kf.R_cw_imu_prior is not None:
             valid_depths = []
             for mp in curr_kf.map_points:
@@ -266,10 +294,10 @@ class LocalMapper:
                     if 0.25 < zc < 8.0:
                         valid_depths.append(zc)
             n_curr_valid = len(valid_depths)
-            if n_curr_valid < 230:
-                z_med = float(np.median(valid_depths)) if n_curr_valid >= 8 else 1.20
-                z_med = float(np.clip(z_med, 0.65, 2.50))
-                need_n = min(150, 230 - n_curr_valid)
+            if n_curr_valid < 110:
+                z_med = float(np.median(valid_depths)) if n_curr_valid >= 8 else 1.15
+                z_med = float(np.clip(z_med, 0.55, 2.20))
+                need_n = min(90, 130 - n_curr_valid)
                 unmatched_indices = [
                     i for i in range(curr_kf.num_kps)
                     if curr_kf.map_points[i] is None and int(curr_kf.kp_octaves[i]) <= 3
@@ -279,10 +307,9 @@ class LocalMapper:
                     unmatched_indices = unmatched_indices[::step][:need_n]
                 R_wc = T_1w.R.T
                 t_wc = o1
-                h_img = float(curr_kf.camera.height)
                 for idx_u in unmatched_indices:
                     u_p, v_p = float(curr_kf.kp_pts[idx_u, 0]), float(curr_kf.kp_pts[idx_u, 1])
-                    z_pt = z_med * (0.88 + 0.24 * (1.0 - v_p / h_img))
+                    z_pt = z_med
                     p_c = np.array([(u_p - cx) / fx * z_pt, (v_p - cy) / fy * z_pt, z_pt], dtype=np.float64)
                     pos_w = R_wc @ p_c + t_wc
                     desc = curr_kf.descriptors[idx_u] if curr_kf.descriptors is not None else None
@@ -321,7 +348,7 @@ class LocalMapper:
         将当前关键帧的地图点投影到一阶/二阶共视关键帧中进行融合 (Fuse)，反之亦然。
         """
         is_live_mono = bool(curr_kf.camera.width == 640 and curr_kf.num_kps > 0 and np.all(curr_kf.depths < 0.0))
-        n_first = 1 if is_live_mono else 10
+        n_first = 2 if is_live_mono else 10
         n_second = 0 if is_live_mono else 5
         target_kfs = set()
         for cov_kf in curr_kf.get_best_covisibility_keyframes(n_first):
@@ -335,6 +362,8 @@ class LocalMapper:
 
         sorted_target_kfs = sorted(target_kfs, key=lambda k: k.id)
         curr_mps = [mp for mp in curr_kf.map_points if mp is not None and not mp.is_bad]
+        if is_live_mono:
+            curr_mps = curr_mps[:120]
         for tkf in sorted_target_kfs:
             self._fuse(tkf, curr_mps)
 
@@ -344,7 +373,10 @@ class LocalMapper:
             for mp in tkf.map_points:
                 if mp is not None and not mp.is_bad and not mp.is_in_keyframe(curr_kf):
                     neigh_mps_set.add(mp)
-        self._fuse(curr_kf, sorted(neigh_mps_set, key=lambda m: m.id))
+        neigh_mps_list = sorted(neigh_mps_set, key=lambda m: m.id)
+        if is_live_mono:
+            neigh_mps_list = neigh_mps_list[-120:]
+        self._fuse(curr_kf, neigh_mps_list)
 
         for mp in curr_kf.map_points:
             if mp is not None and not mp.is_bad:
@@ -455,4 +487,9 @@ class LocalMapper:
                         n_redundant += 1
 
             if n_mps > 15 and n_redundant > 0.90 * n_mps:
+                if kf.prev_kf is not None and kf.next_kf is not None:
+                    if kf.next_kf.imu_preintegrated is not None and kf.imu_preintegrated is not None:
+                        kf.next_kf.imu_preintegrated.merge_previous(kf.imu_preintegrated)
+                    kf.prev_kf.next_kf = kf.next_kf
+                    kf.next_kf.prev_kf = kf.prev_kf
                 kf.set_bad_flag(self.slam_map)

@@ -291,11 +291,13 @@ class WitMotionSerialIMU:
     def __init__(
         self,
         port = "COM3",
-        baud = 9600,
+        baud = 115200,
+        target_rate_hz = 200,
         R_mount = None,
     ):
         self.port = str(port)
         self.baud = int(baud)
+        self.target_rate_hz = int(target_rate_hz)
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
@@ -309,6 +311,7 @@ class WitMotionSerialIMU:
             self.R_mount = np.eye(3, dtype=np.float64)
 
         self._measurements = []
+        self._last_sample_ts = 0.0
         self.latest_raw_acc = np.array([0.0, 0.0, 9.80665], dtype=np.float64)
         self.latest_raw_gyro = np.zeros(3, dtype=np.float64)
         self.latest_raw_euler_deg = np.zeros(3, dtype=np.float64)
@@ -323,39 +326,102 @@ class WitMotionSerialIMU:
         self._ref_tilt_deg = np.zeros(2, dtype=np.float64)
 
     @staticmethod
+    def _has_valid_wit_packet(raw_bytes) :
+        """校验字节流中是否包含合法的 11 字节 0x55 维特智能协议帧 (带帧类型与 Checksum 校验，杜绝错波特率噪声误判)"""
+        n = len(raw_bytes)
+        for i in range(n - 10):
+            if raw_bytes[i] == 0x55 and raw_bytes[i + 1] in (0x50, 0x51, 0x52, 0x53, 0x54):
+                if (sum(raw_bytes[i : i + 10]) & 0xFF) == raw_bytes[i + 10]:
+                    return True
+        return False
+
+    @staticmethod
     def euler_deg_to_R(eul_deg) :
-        """ZYX 欧拉角 (Roll, Pitch, Yaw, 单位: deg) 转 3x3 旋转矩阵 R = Rz(yaw) @ Ry(pitch) @ Rx(roll)"""
+        """机身坐标系 (X右, Y前, Z上) 欧拉角 (Roll, Pitch, Yaw, 单位: deg) 转 3x3 旋转矩阵:
+        - Roll  (eul[0]): 绕 +Y(前/光轴) 旋转 (横滚角)
+        - Pitch (eul[1]): 绕 +X(右)      旋转 (俯仰角，上抬抬头为正)
+        - Yaw   (eul[2]): 绕 +Z(上)      旋转 (偏航角)
+        R = Rz(yaw) @ Ry(roll) @ Rx(pitch)
+        """
         r, p, y = np.deg2rad(eul_deg[0]), np.deg2rad(eul_deg[1]), np.deg2rad(eul_deg[2])
         cr, sr = np.cos(r), np.sin(r)
         cp, sp = np.cos(p), np.sin(p)
         cy, sy = np.cos(y), np.sin(y)
-        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
-        Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]], dtype=np.float64)
+        Ry = np.array([[cr, 0.0, sr], [0.0, 1.0, 0.0], [-sr, 0.0, cr]], dtype=np.float64)
         Rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
         return Rz @ Ry @ Rx
 
     @staticmethod
     def R_to_euler_deg(R) :
-        """3x3 旋转矩阵反解 ZYX 欧拉角 (Roll, Pitch, Yaw, 单位: deg)"""
-        sy = float(np.clip(-R[2, 0], -1.0, 1.0))
-        pitch = np.arcsin(sy)
-        roll = np.arctan2(R[2, 1], R[2, 2])
+        """3x3 旋转矩阵反解机身系 (X右, Y前, Z上) 欧拉角 (Roll, Pitch, Yaw, 单位: deg)"""
+        sr = float(np.clip(-R[2, 0], -1.0, 1.0))
+        roll = np.arcsin(sr)
+        pitch = np.arctan2(R[2, 1], R[2, 2])
         yaw = np.arctan2(R[1, 0], R[0, 0])
         return np.rad2deg(np.array([roll, pitch, yaw], dtype=np.float64))
 
     def start(self) :
-        """打开串口并启动后台高频接收线程"""
+        """打开串口、自动协商 115200 波特率 + 200Hz 回传速率，并启动后台高频接收线程"""
         if self._running:
             return self.is_connected
 
+        unlock_cmd = b"\xFF\xAA\x69\x88\xB5"
+        rate_200hz_cmd = b"\xFF\xAA\x03\x0B\x00"   # RRATE = 0x0B (200Hz)
+        baud_115200_cmd = b"\xFF\xAA\x04\x06\x00"  # BAUD  = 0x06 (115200 bps)
+        rate_20hz_cmd = b"\xFF\xAA\x03\x07\x00"    # 9600 bps 带宽受限时的回退速率 (20Hz)
+
+        probe_bauds = [115200, 9600] if self.baud >= 115200 else [self.baud, 115200, 9600]
+        seen_bauds = []
+        for b_cand in probe_bauds:
+            if b_cand not in seen_bauds:
+                seen_bauds.append(b_cand)
+        probe_bauds = seen_bauds
+
         if os.name == "nt":
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            def _win_set_baud(h_port, baud_rate):
+                dcb = _Win32DCB()
+                dcb.DCBlength = ctypes.sizeof(_Win32DCB)
+                if not kernel32.GetCommState(h_port, ctypes.byref(dcb)):
+                    return False
+                dcb.BaudRate = int(baud_rate)
+                dcb.ByteSize = 8
+                dcb.Parity = 0
+                dcb.StopBits = 0
+                dcb.fBitFields = 1
+                if not kernel32.SetCommState(h_port, ctypes.byref(dcb)):
+                    return False
+                # 低延迟超时 (1ms 字节间隔，2ms 读超时)，避免 200Hz 连续流下 ReadFile 阻塞攒包
+                timeouts = _Win32CommTimeouts(1, 0, 2, 0, 5)
+                kernel32.SetCommTimeouts(h_port, ctypes.byref(timeouts))
+                kernel32.PurgeComm(h_port, 0x0008 | 0x0004)
+                return True
+
+            def _win_probe_valid_pkt(h_port, wait_sec = 0.14):
+                probe_chunk = ctypes.create_string_buffer(256)
+                n_probe = wintypes.DWORD(0)
+                acc_buf = bytearray()
+                t0 = time.perf_counter()
+                while (time.perf_counter() - t0) < wait_sec:
+                    ok_r = kernel32.ReadFile(h_port, probe_chunk, 256, ctypes.byref(n_probe), None)
+                    if ok_r and n_probe.value > 0:
+                        acc_buf.extend(probe_chunk.raw[: n_probe.value])
+                        if self._has_valid_wit_packet(acc_buf):
+                            return True
+                    else:
+                        time.sleep(0.004)
+                return False
+
             candidate_ports = [self.port] + [
-                p for p in ("COM4", "COM3", "COM5", "COM6", "COM7", "COM8", "COM1", "COM2") if p != self.port
+                p for p in ("COM5", "COM4", "COM3", "COM6", "COM7", "COM8", "COM1", "COM2") if p != self.port
             ]
             h = -1
+            active_baud = self.baud
             first_opened_h = -1
             first_opened_port = self.port
+
             for cand in candidate_ports:
                 h_try = kernel32.CreateFileW(
                     f"\\\\.\\{cand}",
@@ -369,43 +435,22 @@ class WitMotionSerialIMU:
                 if h_try in (-1, ctypes.c_void_p(-1).value, None):
                     continue
 
-                dcb = _Win32DCB()
-                dcb.DCBlength = ctypes.sizeof(_Win32DCB)
-                if not kernel32.GetCommState(h_try, ctypes.byref(dcb)):
-                    kernel32.CloseHandle(h_try)
-                    continue
-                dcb.BaudRate = self.baud
-                dcb.ByteSize = 8
-                dcb.Parity = 0
-                dcb.StopBits = 0
-                dcb.fBitFields = 1
-                if not kernel32.SetCommState(h_try, ctypes.byref(dcb)):
-                    kernel32.CloseHandle(h_try)
-                    continue
-
-                timeouts = _Win32CommTimeouts(5, 1, 15, 1, 15)
-                kernel32.SetCommTimeouts(h_try, ctypes.byref(timeouts))
-                kernel32.PurgeComm(h_try, 0x0008 | 0x0004)
-
-                # 探测该串口是否有真实 0x55 维特智能 IMU 数据流到达 (避免误连无数据的虚拟串口)
-                probe_chunk = ctypes.create_string_buffer(128)
-                n_probe = wintypes.DWORD(0)
                 got_wit_pkt = False
-                t_probe = time.perf_counter()
-                while (time.perf_counter() - t_probe) < 0.15:
-                    ok_r = kernel32.ReadFile(h_try, probe_chunk, 128, ctypes.byref(n_probe), None)
-                    if ok_r and n_probe.value > 0:
-                        raw_bytes = probe_chunk.raw[: n_probe.value]
-                        if 0x55 in raw_bytes:
-                            got_wit_pkt = True
-                            break
-                    time.sleep(0.01)
+                detected_baud = self.baud
+                for b_try in probe_bauds:
+                    if not _win_set_baud(h_try, b_try):
+                        continue
+                    if _win_probe_valid_pkt(h_try, wait_sec=0.14):
+                        got_wit_pkt = True
+                        detected_baud = b_try
+                        break
 
                 if got_wit_pkt:
                     if first_opened_h not in (-1, ctypes.c_void_p(-1).value, None):
                         kernel32.CloseHandle(first_opened_h)
                     h = h_try
                     self.port = cand
+                    active_baud = detected_baud
                     break
                 else:
                     if first_opened_h in (-1, ctypes.c_void_p(-1).value, None):
@@ -424,14 +469,36 @@ class WitMotionSerialIMU:
 
             self._win_handle = h
             self.is_connected = True
-            # 发送 WitMotion 临时解锁指令 + 20Hz 回传速率配置 (不写入掉电 EEPROM，仅本次会话提升帧间 IMU 采样密度至 20Hz)
+            self.baud = active_baud
+
+            # 自动升频至 115200 bps + 200Hz 回传速率 (若传感器当前在 9600 bps，则先发送切波特率指令再重握手验证)
             try:
                 n_written = wintypes.DWORD(0)
-                unlock_cmd = b"\xFF\xAA\x69\x88\xB5"
-                rate_20hz_cmd = b"\xFF\xAA\x03\x07\x00"
-                kernel32.WriteFile(self._win_handle, unlock_cmd, len(unlock_cmd), ctypes.byref(n_written), None)
-                time.sleep(0.015)
-                kernel32.WriteFile(self._win_handle, rate_20hz_cmd, len(rate_20hz_cmd), ctypes.byref(n_written), None)
+                if active_baud != 115200:
+                    kernel32.WriteFile(self._win_handle, unlock_cmd, len(unlock_cmd), ctypes.byref(n_written), None)
+                    time.sleep(0.02)
+                    kernel32.WriteFile(self._win_handle, rate_200hz_cmd, len(rate_200hz_cmd), ctypes.byref(n_written), None)
+                    time.sleep(0.02)
+                    kernel32.WriteFile(self._win_handle, baud_115200_cmd, len(baud_115200_cmd), ctypes.byref(n_written), None)
+                    time.sleep(0.03)
+                    if _win_set_baud(self._win_handle, 115200):
+                        kernel32.WriteFile(self._win_handle, unlock_cmd, len(unlock_cmd), ctypes.byref(n_written), None)
+                        time.sleep(0.015)
+                        kernel32.WriteFile(self._win_handle, rate_200hz_cmd, len(rate_200hz_cmd), ctypes.byref(n_written), None)
+                        if _win_probe_valid_pkt(self._win_handle, wait_sec=0.18):
+                            self.baud = 115200
+                        else:
+                            # 传感器硬件固定在原波特率，安全回退并配置最高可用帧率
+                            _win_set_baud(self._win_handle, active_baud)
+                            kernel32.WriteFile(self._win_handle, unlock_cmd, len(unlock_cmd), ctypes.byref(n_written), None)
+                            time.sleep(0.015)
+                            kernel32.WriteFile(self._win_handle, rate_20hz_cmd, len(rate_20hz_cmd), ctypes.byref(n_written), None)
+                            self.baud = active_baud
+                else:
+                    kernel32.WriteFile(self._win_handle, unlock_cmd, len(unlock_cmd), ctypes.byref(n_written), None)
+                    time.sleep(0.015)
+                    kernel32.WriteFile(self._win_handle, rate_200hz_cmd, len(rate_200hz_cmd), ctypes.byref(n_written), None)
+                    self.baud = 115200
             except Exception:
                 pass
         else:
@@ -445,34 +512,67 @@ class WitMotionSerialIMU:
                     if p_cand not in linux_cands:
                         linux_cands.append(p_cand)
                 first_ser = None
+                active_baud = self.baud
                 for p_cand in linux_cands:
-                    try:
-                        ser = serial.Serial(p_cand, self.baud, timeout=0.18)
-                        probe = ser.read(64)
-                        if probe and (0x55 in probe):
-                            self._pyserial_obj = ser
-                            self.port = p_cand
-                            if first_ser is not None and first_ser is not ser:
-                                first_ser.close()
-                            break
-                        if first_ser is None:
-                            first_ser = ser
-                            self.port = p_cand
-                        else:
-                            ser.close()
-                    except Exception:
-                        continue
+                    found_on_port = False
+                    for b_try in probe_bauds:
+                        try:
+                            ser = serial.Serial(p_cand, b_try, timeout=0.14)
+                            probe = ser.read(128)
+                            if probe and self._has_valid_wit_packet(probe):
+                                self._pyserial_obj = ser
+                                self.port = p_cand
+                                active_baud = b_try
+                                if first_ser is not None and first_ser is not ser:
+                                    first_ser.close()
+                                found_on_port = True
+                                break
+                            if first_ser is None:
+                                first_ser = ser
+                                self.port = p_cand
+                            else:
+                                ser.close()
+                        except Exception:
+                            continue
+                    if found_on_port:
+                        break
                 if self._pyserial_obj is None and first_ser is not None:
                     self._pyserial_obj = first_ser
                 if self._pyserial_obj is None:
                     self.is_connected = False
                     return False
-                self._pyserial_obj.timeout = 0.02
+                self._pyserial_obj.timeout = 0.005
                 self.is_connected = True
+                self.baud = active_baud
                 try:
-                    self._pyserial_obj.write(b"\xFF\xAA\x69\x88\xB5")
-                    time.sleep(0.015)
-                    self._pyserial_obj.write(b"\xFF\xAA\x03\x07\x00")
+                    if active_baud != 115200:
+                        self._pyserial_obj.write(unlock_cmd)
+                        time.sleep(0.02)
+                        self._pyserial_obj.write(rate_200hz_cmd)
+                        time.sleep(0.02)
+                        self._pyserial_obj.write(baud_115200_cmd)
+                        time.sleep(0.03)
+                        self._pyserial_obj.baudrate = 115200
+                        self._pyserial_obj.reset_input_buffer()
+                        self._pyserial_obj.write(unlock_cmd)
+                        time.sleep(0.015)
+                        self._pyserial_obj.write(rate_200hz_cmd)
+                        time.sleep(0.08)
+                        probe_115200 = self._pyserial_obj.read(128)
+                        if probe_115200 and self._has_valid_wit_packet(probe_115200):
+                            self.baud = 115200
+                        else:
+                            self._pyserial_obj.baudrate = active_baud
+                            self._pyserial_obj.reset_input_buffer()
+                            self._pyserial_obj.write(unlock_cmd)
+                            time.sleep(0.015)
+                            self._pyserial_obj.write(rate_20hz_cmd)
+                            self.baud = active_baud
+                    else:
+                        self._pyserial_obj.write(unlock_cmd)
+                        time.sleep(0.015)
+                        self._pyserial_obj.write(rate_200hz_cmd)
+                        self.baud = 115200
                 except Exception:
                     pass
             except Exception:
@@ -499,7 +599,7 @@ class WitMotionSerialIMU:
                     buf.extend(chunk.raw[: n_read.value])
                     has_acc = self._parse_buffer(buf, has_acc)
                 else:
-                    time.sleep(0.002)
+                    time.sleep(0.001)
         else:
             while self._running and self._pyserial_obj is not None:
                 data = self._pyserial_obj.read(256)
@@ -507,7 +607,7 @@ class WitMotionSerialIMU:
                     buf.extend(data)
                     has_acc = self._parse_buffer(buf, has_acc)
                 else:
-                    time.sleep(0.002)
+                    time.sleep(0.001)
 
     def _parse_buffer(self, buf, has_acc) :
         while len(buf) >= 11:
@@ -534,20 +634,11 @@ class WitMotionSerialIMU:
                     acc_norm = float(np.linalg.norm(raw_acc))
                     self.latest_raw_acc = raw_acc
                     if self._mount_calib_count == 0 and 8.2 < acc_norm < 11.5 and az > 6.0:
-                        r_acc = float(np.rad2deg(np.arctan2(ay, az)))
-                        p_acc = float(np.rad2deg(np.arctan2(-ax, np.hypot(ay, az))))
+                        p_acc = float(np.rad2deg(np.arctan2(ay, az)))
+                        r_acc = float(np.rad2deg(np.arctan2(-ax, np.hypot(ay, az))))
                         self._ref_tilt_deg = np.array([r_acc, p_acc], dtype=np.float64)
                         self.R_mount = self.euler_deg_to_R(np.array([r_acc, p_acc, 0.0], dtype=np.float64))
                     acc_leveled = self.R_mount @ raw_acc
-                    tilt_gyro = float(np.hypot(self.latest_gyro[0], self.latest_gyro[1]))
-                    if (
-                        abs(self.latest_euler_deg[0]) < 6.0
-                        and abs(self.latest_euler_deg[1]) < 6.0
-                        and tilt_gyro < 0.30
-                        and 8.2 < acc_norm < 11.5
-                    ):
-                        acc_leveled[0] *= 0.12
-                        acc_leveled[1] *= 0.12
                     self.latest_acc = acc_leveled
                     self.latest_temp_c = float(v3) / 100.0
                     has_acc = True
@@ -557,85 +648,117 @@ class WitMotionSerialIMU:
                     wz = np.deg2rad((v2 / 32768.0) * 2000.0)
                     self.latest_raw_gyro = np.array([wx, wy, wz], dtype=np.float64)
                     gyro_leveled = self.R_mount @ self.latest_raw_gyro
-                    # 水平桌面重力约束：当加速度计与姿态角确认设备处于水平面 (|Roll|<6°, |Pitch|<6°) 且无显著翻滚/俯仰角速度
-                    # (或处于快速水平偏航旋转 |Wz| 主导状态) 时，抑制贴装倾角在偏航旋转时向 Roll/Pitch 轴产生的正交耦合分量
-                    tilt_gyro_lvl = float(np.hypot(gyro_leveled[0], gyro_leveled[1]))
-                    yaw_dominant = abs(gyro_leveled[2]) > 1.8 * tilt_gyro_lvl
-                    if (
-                        abs(self.latest_euler_deg[0]) < 6.0
-                        and abs(self.latest_euler_deg[1]) < 6.0
-                        and (tilt_gyro_lvl < 0.35 or yaw_dominant)
-                    ):
-                        gyro_leveled[0] = 0.0 if abs(gyro_leveled[0]) < 0.04 else gyro_leveled[0] * 0.04
-                        gyro_leveled[1] = 0.0 if abs(gyro_leveled[1]) < 0.04 else gyro_leveled[1] * 0.04
+                    # 仅对完全静止时的传感器底噪 (<0.0035 rad/s ≈ 0.2 deg/s) 置零，保留完整 3 轴 200Hz 角速度供 ORB-SLAM3 流形预积分
+                    if float(np.linalg.norm(gyro_leveled)) < 0.0035:
+                        gyro_leveled[:] = 0.0
                     self.latest_gyro = gyro_leveled
                     if has_acc or self.total_packets > 2:
+                        dt_nom = 1.0 / float(max(20, self.target_rate_hz))
+                        ts_sample = ts_now
+                        if self._last_sample_ts > 0.0 and ts_sample <= self._last_sample_ts + 1e-4:
+                            ts_sample = self._last_sample_ts + dt_nom
+                        self._last_sample_ts = ts_sample
                         self._measurements.append(
                             ImuMeasurement(
-                                timestamp=ts_now,
+                                timestamp=ts_sample,
                                 acc=self.latest_acc.copy(),
                                 gyro=self.latest_gyro.copy(),
                             )
                         )
-                        if len(self._measurements) > 2000:
-                            del self._measurements[: len(self._measurements) - 1000]
+                        if len(self._measurements) > 4000:
+                            del self._measurements[: len(self._measurements) - 2000]
                 elif ptype == 0x53:  # 欧拉角帧 (±180 deg)
-                    roll = (v0 / 32768.0) * 180.0
-                    pitch = (v1 / 32768.0) * 180.0
+                    # 机身系 (X右, Y前, Z上): v0(绕+X右轴) = 俯仰角 Pitch(上抬为正), v1(绕+Y前轴) = 横滚角 Roll(侧倾)
+                    pitch = (v0 / 32768.0) * 180.0
+                    roll = (v1 / 32768.0) * 180.0
                     yaw = (v2 / 32768.0) * 180.0
-                    # 校验串口包物理合理性，拒绝断包错位导致的异常跳变角 (如 -75° 伪包)
-                    if abs(roll) > 65.0 or abs(pitch) > 65.0:
+                    # 校验串口包物理合理性，拒绝断包错位导致的异常跳变角
+                    if abs(roll) > 75.0 or abs(pitch) > 75.0:
                         continue
                     self.latest_raw_euler_deg = np.array([roll, pitch, yaw], dtype=np.float64)
                     tilt_gyro = float(np.hypot(self.latest_gyro[0], self.latest_gyro[1]))
-                    acc_norm = float(np.linalg.norm(self.latest_raw_acc))
                     if self._mount_calib_count == 0 and abs(roll) < 40.0 and abs(pitch) < 40.0:
                         self._ref_tilt_deg = np.array([roll, pitch], dtype=np.float64)
                         self.R_mount = self.euler_deg_to_R(np.array([roll, pitch, 0.0], dtype=np.float64))
                         self._mount_calib_count = 1
                         self._mount_auto_checked = True
-                    elif self._mount_calib_count < 15 and tilt_gyro < 0.30 and abs(roll) < 40.0 and abs(pitch) < 40.0:
-                        alpha = 0.35
+                    elif self._mount_calib_count < 12 and tilt_gyro < 0.20 and abs(roll) < 40.0 and abs(pitch) < 40.0:
+                        alpha = 0.30
                         self._ref_tilt_deg = (1.0 - alpha) * self._ref_tilt_deg + alpha * np.array([roll, pitch], dtype=np.float64)
                         self.R_mount = self.euler_deg_to_R(
                             np.array([self._ref_tilt_deg[0], self._ref_tilt_deg[1], 0.0], dtype=np.float64)
                         )
                         self._mount_calib_count += 1
-                    elif (
-                        tilt_gyro < 0.28
-                        and 8.5 < acc_norm < 11.2
-                        and abs(roll - self._ref_tilt_deg[0]) < 12.0
-                        and abs(pitch - self._ref_tilt_deg[1]) < 12.0
-                    ):
-                        # 在水平面平移或绕 Z 轴偏航旋转时，自适应跟踪桌面/贴装基准倾角，消除偏航旋转 180° 时的斜面倾角反转耦合
-                        alpha = 0.20
-                        self._ref_tilt_deg = (1.0 - alpha) * self._ref_tilt_deg + alpha * np.array([roll, pitch], dtype=np.float64)
-                        self.R_mount = self.euler_deg_to_R(
-                            np.array([self._ref_tilt_deg[0], self._ref_tilt_deg[1], 0.0], dtype=np.float64)
-                        )
                     rel_roll = float(roll - self._ref_tilt_deg[0])
                     rel_pitch = float(pitch - self._ref_tilt_deg[1])
-                    if abs(rel_roll) < 4.5 and abs(rel_pitch) < 4.5 and tilt_gyro < 0.30:
-                        rel_roll *= 0.12
-                        rel_pitch *= 0.12
                     self.latest_euler_deg = np.array([rel_roll, rel_pitch, yaw], dtype=np.float64)
         return has_acc
 
     def get_measurements_between(self, t_prev, t_curr) :
-        """获取 (t_prev, t_curr] 区间内的所有 IMU 采样；若间隔较短尚未到达新串口包，则用最新状态零阶保持补齐"""
+        """
+        获取 (t_prev, t_curr] 区间内的 200Hz IMU 采样序列：
+        - 若传感器已工作在 115200 bps / 200Hz 硬件高速模式，直接返回帧间原始硬件采样；
+        - 若串口处于 9600 bps 带宽受限模式或存在系统调度间隙，则在真实锚点包之间按 200Hz (dt=5ms) 线性插值重构高频预积分序列。
+        """
         with self._lock:
-            batch = [m for m in self._measurements if t_prev < m.timestamp <= t_curr]
+            raw_batch = [m for m in self._measurements if t_prev < m.timestamp <= t_curr]
+            prev_candidates = [m for m in self._measurements if m.timestamp <= t_prev]
+            m_prev_anchor = prev_candidates[-1] if len(prev_candidates) > 0 else None
             # 清理过旧的历史缓存
             self._measurements = [m for m in self._measurements if m.timestamp > t_prev - 1.0]
-            if len(batch) == 0 and self.total_packets > 0:
-                batch = [
-                    ImuMeasurement(
-                        timestamp=t_curr,
-                        acc=self.latest_acc.copy(),
-                        gyro=self.latest_gyro.copy(),
-                    )
-                ]
-            return batch
+
+            if self.total_packets == 0:
+                return []
+
+            dt_span = float(max(1e-3, t_curr - t_prev))
+            dt_target = 1.0 / float(max(20, self.target_rate_hz))  # 200Hz -> 0.005s
+            expected_n = max(1, int(round(min(dt_span, 0.20) / dt_target)))
+
+            # 若硬件原始采样密度已达到目标 200Hz 的 75% 以上，直接使用原始硬件包
+            if len(raw_batch) >= max(2, int(0.75 * expected_n)):
+                return raw_batch
+
+            # 构建时间锚点序列 (t_prev -> raw_batch -> t_curr) 并按 200Hz (5ms) 网格线性插值
+            anchors_t = [float(t_prev)]
+            if m_prev_anchor is not None:
+                anchors_acc = [m_prev_anchor.acc.copy()]
+                anchors_gyro = [m_prev_anchor.gyro.copy()]
+            elif len(raw_batch) > 0:
+                anchors_acc = [raw_batch[0].acc.copy()]
+                anchors_gyro = [raw_batch[0].gyro.copy()]
+            else:
+                anchors_acc = [self.latest_acc.copy()]
+                anchors_gyro = [self.latest_gyro.copy()]
+
+            for m in raw_batch:
+                if m.timestamp > anchors_t[-1] + 1e-5:
+                    anchors_t.append(float(m.timestamp))
+                    anchors_acc.append(m.acc.copy())
+                    anchors_gyro.append(m.gyro.copy())
+
+            if t_curr > anchors_t[-1] + 1e-5:
+                anchors_t.append(float(t_curr))
+                anchors_acc.append(self.latest_acc.copy())
+                anchors_gyro.append(self.latest_gyro.copy())
+
+            out_batch = []
+            seg_idx = 0
+            n_anchors = len(anchors_t)
+            for k in range(1, expected_n + 1):
+                tk = t_prev + (dt_span * k) / float(expected_n)
+                while seg_idx + 1 < n_anchors - 1 and anchors_t[seg_idx + 1] < tk:
+                    seg_idx += 1
+                if n_anchors == 1:
+                    acc_k = anchors_acc[0].copy()
+                    gyro_k = anchors_gyro[0].copy()
+                else:
+                    t0 = anchors_t[seg_idx]
+                    t1 = anchors_t[min(seg_idx + 1, n_anchors - 1)]
+                    alpha = float(np.clip((tk - t0) / max(1e-6, t1 - t0), 0.0, 1.0))
+                    acc_k = (1.0 - alpha) * anchors_acc[seg_idx] + alpha * anchors_acc[min(seg_idx + 1, n_anchors - 1)]
+                    gyro_k = (1.0 - alpha) * anchors_gyro[seg_idx] + alpha * anchors_gyro[min(seg_idx + 1, n_anchors - 1)]
+                out_batch.append(ImuMeasurement(timestamp=tk, acc=acc_k, gyro=gyro_k))
+            return out_batch
 
     def get_status_snapshot(self) :
         with self._lock:
@@ -643,6 +766,7 @@ class WitMotionSerialIMU:
                 "connected": self.is_connected,
                 "port": self.port,
                 "baud": self.baud,
+                "rate_hz": self.target_rate_hz,
                 "total_packets": int(self.total_packets),
                 "acc_mps2": self.latest_acc.copy(),
                 "gyro_rads": self.latest_gyro.copy(),
@@ -762,7 +886,7 @@ class LiveStereoInertialStream:
         concat_width = 1280,
         height = 480,
         imu_port = "COM3",
-        imu_baud = 9600,
+        imu_baud = 115200,
         calib_json = "config/custom_stereo_imu.json",
         force_monocular = False,
     ):
@@ -777,12 +901,14 @@ class LiveStereoInertialStream:
         self.imu_ba = np.zeros(3, dtype=np.float64)
         self.R_imu_mount = None
 
-        # 1. 构建双目相机模型 (若存在标定文件则加载真实标定参数，否则采用 640x480 标准初始内参)
+        # 1. 构建双目/单目相机模型 (若存在标定文件则加载真实标定参数，否则采用 640x480 标准初始内参)
+        self._calib_cfg = None
         if calib_json and os.path.exists(calib_json):
             import json
-            self.camera = StereoCamera.from_calib_file(calib_json)
+            self.camera = StereoCamera.from_calib_file(calib_json, is_monocular=self.is_monocular)
             with open(calib_json, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
+            self._calib_cfg = cfg
             if "imu_bg" in cfg:
                 self.imu_bg = np.asarray(cfg["imu_bg"], dtype=np.float64).reshape(3)
             if "imu_ba" in cfg:
@@ -838,6 +964,13 @@ class LiveStereoInertialStream:
             ret_probe, frame_probe = self.cap.read()
             if ret_probe and frame_probe is not None:
                 self._last_valid_frame = frame_probe.copy()
+
+        # 若自动检测切换为单目模式，立即将相机模型切换为无双目极线旋转 R1 的对称单目中心主点模型
+        if self.is_monocular and self._calib_cfg is not None:
+            K_l = np.asarray(self._calib_cfg["K_l"], dtype=np.float64).reshape(3, 3)
+            D_l = np.asarray(self._calib_cfg["D_l"], dtype=np.float64).reshape(-1)
+            T_b_c1 = np.asarray(self._calib_cfg.get("T_b_c1", np.eye(4).tolist()), dtype=np.float64).reshape(4, 4)
+            self.camera.init_mono_rectification(K_l, D_l, T_b_c1=T_b_c1)
 
         # 预热读取几帧并缓存最新有效帧
         for _ in range(3):

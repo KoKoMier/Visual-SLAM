@@ -118,6 +118,35 @@ class StereoCamera:
         # 同步修正左相机到 Body 外参旋转: R_b_c1_rect = R_b_c1_raw * R1^T
         self.T_b_c1[:3, :3] = self.T_b_c1[:3, :3] @ R1.T
 
+    def init_mono_rectification(self, K_l, D_l, T_b_c1 = None) :
+        """
+        针对单目模式初始化对称无倾角相机模型:
+        不执行双目极线旋转 R1 (避免双目外参 t_r_l 误差引入 12.5° 滚转 / 20.1° 偏航斜向畸变与黑边)，
+        并将主点严格居中于 (width/2, height/2)，彻底消除左右移动时的斜上下/前后轴耦合。
+        """
+        K_l = np.ascontiguousarray(K_l, dtype=np.float64).reshape(3, 3)
+        f_avg = 0.5 * (float(K_l[0, 0]) + float(K_l[1, 1]))
+        if f_avg < 150.0 or f_avg > 1500.0:
+            f_avg = 536.0
+        self.fx = f_avg
+        self.fy = f_avg
+        self.cx = float(self.width) * 0.5
+        self.cy = float(self.height) * 0.5
+        self.inv_fx = 1.0 / self.fx
+        self.inv_fy = 1.0 / self.fy
+        self.bf = self.baseline * self.fx
+        self.K = np.array([
+            [self.fx, 0.0,     self.cx],
+            [0.0,     self.fy, self.cy],
+            [0.0,     0.0,     1.0    ]
+        ], dtype=np.float64)
+        if T_b_c1 is not None:
+            self.T_b_c1 = np.asarray(T_b_c1, dtype=np.float64).reshape(4, 4).copy()
+        self._map1_l = None
+        self._map2_l = None
+        self._map1_r = None
+        self._map2_r = None
+
     def rectify_stereo(self, img_l, img_r) :
         """对原始双目图像进行去畸变与极线对齐"""
         if self._map1_l is None:
@@ -218,9 +247,9 @@ class StereoCamera:
         return cam
 
     @classmethod
-    def from_calib_file(cls, calib_json_path) :
+    def from_calib_file(cls, calib_json_path, is_monocular = False) :
         """
-        从 calibrate_stereo_camera.py 生成的 JSON 标定文件直接构建并初始化双目极线校正相机
+        从 calibrate_stereo_camera.py 生成的 JSON 标定文件直接构建并初始化双目或单目相机
         """
         import json
         with open(calib_json_path, "r", encoding="utf-8") as f:
@@ -250,5 +279,8 @@ class StereoCamera:
             fps=fps,
             T_b_c1=T_b_c1
         )
-        cam.init_stereo_rectification(K_l, D_l, K_r, D_r, R_r_l, t_r_l)
+        if is_monocular:
+            cam.init_mono_rectification(K_l, D_l, T_b_c1=T_b_c1)
+        else:
+            cam.init_stereo_rectification(K_l, D_l, K_r, D_r, R_r_l, t_r_l)
         return cam

@@ -753,8 +753,8 @@ class Live3DTrajectorySketch:
     def __init__(self, width = 1280, height = 500) :
         self.width = int(width)
         self.height = int(height)
-        self.yaw_deg = -35.0
-        self.pitch_deg = 26.0
+        self.yaw_deg = 0.0
+        self.pitch_deg = 20.0
         self.traj_history = []
         self.rot_history = []
         self.kf_positions = []

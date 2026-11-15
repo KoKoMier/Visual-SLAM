@@ -56,8 +56,8 @@ class TrackingState(IntEnum):
 class Tracker:
     __slots__ = (
         "camera", "slam_map", "local_mapper", "loop_closer",
-        "orb_extractor", "imu_preintegrator",
-        "state", "curr_frame", "last_frame", "prev_frame", "mono_init_frame", "ref_kf",
+        "orb_extractor", "imu_preintegrator", "imu_preintegrator_from_last_kf",
+        "state", "curr_frame", "last_frame", "prev_frame", "mono_init_frame", "ref_kf", "last_kf",
         "last_kf_frame_id",
         "local_keyframes", "local_mappoints",
         "velocity", "has_velocity",
@@ -75,7 +75,7 @@ class Tracker:
         loop_closer,
         n_features = 600,
         use_hybrid_optical_flow = True,
-        use_hfnet = True,
+        use_hfnet = False,
         hfnet_root = None,
     ):
         self.camera = camera
@@ -92,6 +92,7 @@ class Tracker:
         else:
             self.orb_extractor = ORBExtractor(n_features=n_features)
         self.imu_preintegrator = ImuPreintegrator()
+        self.imu_preintegrator_from_last_kf = ImuPreintegrator()
 
         self.state = TrackingState.NO_IMAGES_YET
         self.curr_frame = None
@@ -99,6 +100,7 @@ class Tracker:
         self.prev_frame = None
         self.mono_init_frame = None
         self.ref_kf = None
+        self.last_kf = None
         self.last_kf_frame_id = 0
 
         self.local_keyframes = []
@@ -397,6 +399,55 @@ class Tracker:
         self.local_mappoints = self.slam_map.get_all_mappoints()
         self.state = TrackingState.OK
 
+    def _preintegrate_imu(self, imu_measurements, timestamp) :
+        """
+        对应 ORB-SLAM3 Tracking::PreintegrateIMU():
+        同时对相邻帧预积分器 (imu_preintegrator) 与关键帧预积分器 (imu_preintegrator_from_last_kf)
+        执行中点法流形预积分，精确对齐 [t_prev, timestamp] 时间区间。
+        """
+        bg_ref = (
+            self.last_frame.bg
+            if self.last_frame is not None
+            else (self.last_kf.bg if self.last_kf is not None else None)
+        )
+        ba_ref = (
+            self.last_frame.ba
+            if self.last_frame is not None
+            else (self.last_kf.ba if self.last_kf is not None else None)
+        )
+        self.imu_preintegrator.reset(bg=bg_ref, ba=ba_ref)
+        if imu_measurements is None or len(imu_measurements) == 0:
+            return
+
+        t_prev_frame = (
+            self.last_frame.timestamp
+            if self.last_frame is not None
+            else (imu_measurements[0].timestamp - 0.005)
+        )
+        n_m = len(imu_measurements)
+        for i in range(n_m):
+            m_curr = imu_measurements[i]
+            if i == 0:
+                dt = m_curr.timestamp - t_prev_frame
+                acc_mid = m_curr.acc
+                gyro_mid = m_curr.gyro
+            else:
+                m_prev = imu_measurements[i - 1]
+                dt = m_curr.timestamp - m_prev.timestamp
+                acc_mid = 0.5 * (m_prev.acc + m_curr.acc)
+                gyro_mid = 0.5 * (m_prev.gyro + m_curr.gyro)
+            if dt > 1e-5:
+                dt_c = min(float(dt), 0.10)
+                self.imu_preintegrator.integrate_new_measurement(acc_mid, gyro_mid, dt_c)
+                self.imu_preintegrator_from_last_kf.integrate_new_measurement(acc_mid, gyro_mid, dt_c)
+
+        last_m = imu_measurements[-1]
+        dt_tail = timestamp - last_m.timestamp
+        if dt_tail > 1e-5:
+            dt_c = min(float(dt_tail), 0.05)
+            self.imu_preintegrator.integrate_new_measurement(last_m.acc, last_m.gyro, dt_c)
+            self.imu_preintegrator_from_last_kf.integrate_new_measurement(last_m.acc, last_m.gyro, dt_c)
+
     def grab_image_monocular(
         self,
         img_left,
@@ -410,23 +461,11 @@ class Tracker:
         t_start = time.perf_counter()
         rect_l = self.camera.rectify_mono(img_left)
 
-        # 0. 若包含 IMU 数据，执行帧间流形预积分 (完整覆盖 [last_frame.timestamp, timestamp] 区间)
+        # 0. 若包含 IMU 数据，执行帧间与关键帧间流形预积分 (Tracking::PreintegrateIMU)
         if imu_measurements is not None and len(imu_measurements) > 0:
-            self.imu_preintegrator.reset(
-                bg=self.last_frame.bg if self.last_frame is not None else None,
-                ba=self.last_frame.ba if self.last_frame is not None else None
-            )
-            for idx_m, meas in enumerate(imu_measurements):
-                if idx_m == 0:
-                    prev_t = self.last_frame.timestamp if self.last_frame is not None else (meas.timestamp - 0.005)
-                    dt = max(1e-4, meas.timestamp - prev_t)
-                else:
-                    dt = max(1e-4, meas.timestamp - imu_measurements[idx_m - 1].timestamp)
-                self.imu_preintegrator.integrate_new_measurement(meas.acc, meas.gyro, dt)
-            last_meas = imu_measurements[-1]
-            dt_tail = timestamp - last_meas.timestamp
-            if dt_tail > 1e-4:
-                self.imu_preintegrator.integrate_new_measurement(last_meas.acc, last_meas.gyro, dt_tail)
+            self._preintegrate_imu(imu_measurements, timestamp)
+        else:
+            self.imu_preintegrator.reset()
 
         # 1. 单目 / 单目+IMU 初始化
         if self.state in (TrackingState.NO_IMAGES_YET, TrackingState.NOT_INITIALIZED):
@@ -442,7 +481,7 @@ class Tracker:
             self.timing_stats["total_ms"].append((t_end - t_start) * 1000.0)
             return self.curr_frame.T_cw.copy()
 
-        # 2. 正常跟踪状态 (纯单目恒速模型预测 或 单目+IMU 预积分预测 + 旋转流形先验 BA)
+        # 2. 正常跟踪状态 (ORB-SLAM3 PredictStateIMU / 恒速模型 + PoseInertialOptimization + TrackLocalMap)
         t_fe_start = time.perf_counter()
         self._update_last_frame_replaced_mappoints()
         need_kf_or_retrack = False
@@ -453,9 +492,13 @@ class Tracker:
             self.last_frame.T_cw.R.copy() if (self.camera.width == 640 and self.last_frame is not None and self.last_frame.has_pose) else None
         )
         if R_cw_imu_prior is not None:
-            w_rot_imu = 2.0e6 if self.camera.width == 640 else (2.0e6 if len(imu_measurements) >= 5 else 80.0)
+            w_rot_imu = 1.5e5 if self.camera.width == 640 else (1.5e5 if len(imu_measurements) >= 5 else 80.0)
         else:
             w_rot_imu = 0.0
+
+        t_cw_imu_prior = T_cw_pred_init.t.copy() if (has_imu_prior and self.slam_map.imu_initialized) else None
+        w_pos_imu = (4.0e3 if self.slam_map.inertial_ba1 else 8.0e2) if t_cw_imu_prior is not None else 0.0
+
         trans_gate = 1.0
         T_cw_flow_prior = None
         flow_pts_cached = None
@@ -466,15 +509,23 @@ class Tracker:
                 self.last_frame, rect_l, rect_l, self.camera, T_cw_pred=T_cw_pred_init
             )
             if self.camera.width == 640:
+                tracked_set = {mp for mp in tracked_mps if mp is not None}
+                for old_mp in self.last_frame.map_points:
+                    if old_mp is not None and not old_mp.is_bad and old_mp.num_observations() == 0 and old_mp not in tracked_set:
+                        old_mp.set_bad_flag(self.slam_map)
                 R_cw_imu_prior, trans_gate = self._estimate_rotation_and_trans_gate(
                     kp_pts, tracked_mps, imu_measurements, R_cw_imu_prior
                 )
                 if R_cw_imu_prior is not None:
-                    p_pred_init = -(T_cw_pred_init.R.T @ T_cw_pred_init.t)
+                    p_last_init = self.last_frame.get_camera_center() if (self.last_frame is not None and self.last_frame.has_pose) else -(T_cw_pred_init.R.T @ T_cw_pred_init.t)
+                    dp_flow_init = self._compute_horizon_decoupled_step(R_cw_imu_prior, trans_gate)
+                    p_pred_init = p_last_init + dp_flow_init
                     T_cw_pred_init = SE3(R_cw_imu_prior, -(R_cw_imu_prior @ p_pred_init))
+                    t_cw_imu_prior = T_cw_pred_init.t.copy()
+                    w_pos_imu = 5.0e4
             flow_pts_cached = kp_pts
             flow_mps_cached = tracked_mps
-            if len(kp_pts) >= 28:
+            if len(kp_pts) >= 25:
                 self.curr_frame = Frame(
                     timestamp=timestamp,
                     camera=self.camera,
@@ -487,23 +538,24 @@ class Tracker:
                 )
                 self.curr_frame.map_points = list(tracked_mps)
                 self.curr_frame.ref_kf = self.ref_kf
+                self.curr_frame.last_kf = self.last_kf
+                self.curr_frame.prev_frame = self.last_frame
+                self.curr_frame.imu_preintegrated_frame = self.imu_preintegrator
+                self.curr_frame.imu_preintegrated = self.imu_preintegrator_from_last_kf
                 self.curr_frame.R_cw_imu_prior = R_cw_imu_prior
+                if self.last_frame is not None:
+                    self.curr_frame.bg = self.last_frame.bg.copy()
+                    self.curr_frame.ba = self.last_frame.ba.copy()
                 self.curr_frame.set_pose(T_cw_pred_init)
 
-                w_rot_opt = w_rot_imu
                 n_inliers = Optimizer.pose_optimization(
                     self.curr_frame,
-                    n_its_per_round=6,
+                    n_its_per_round=4 if self.camera.width == 640 else 6,
                     R_cw_prior=R_cw_imu_prior,
-                    rot_prior_weight=w_rot_opt,
+                    rot_prior_weight=w_rot_imu,
+                    t_cw_prior=t_cw_imu_prior,
+                    pos_prior_weight=w_pos_imu,
                 )
-                # 实机 640x480 旋转阶段 (trans_gate < 0.85): 串口 IMU 与 USB 摄像头存在 10~30ms 包相位差，
-                # 对已通过双向 LK 光流一致性校验 (fb_err <= 1.5px) 的跟踪点豁免因 IMU 瞬时相位差导致的卡方误剔除
-                if self.camera.width == 640 and trans_gate < 0.85 and n_inliers < int(0.75 * len(kp_pts)):
-                    self.curr_frame.outliers[:] = False
-                    n_inliers = sum(
-                        1 for mp in self.curr_frame.map_points if mp is not None and not mp.is_bad
-                    )
                 for idx, mp in enumerate(self.curr_frame.map_points):
                     if mp is not None:
                         if self.curr_frame.outliers[idx]:
@@ -515,20 +567,12 @@ class Tracker:
                             mp.increase_found()
 
                 if n_inliers >= 18:
-                    p_flow_opt = self.curr_frame.get_camera_center()
-                    R_flow_opt = R_cw_imu_prior if R_cw_imu_prior is not None else self.curr_frame.T_cw.R
-                    T_cw_flow_prior = SE3(R_flow_opt, -(R_flow_opt @ p_flow_opt))
+                    T_cw_flow_prior = self.curr_frame.T_cw.copy()
                     flow_pts_cached = self.curr_frame.kp_pts.copy()
                     flow_mps_cached = list(self.curr_frame.map_points)
 
-                th_retrack = 22 if self.camera.width == 640 else 38
-                frames_since_kf = self.curr_frame.id - self.last_kf_frame_id
-                if self.camera.width == 640 and frames_since_kf <= 3 and n_inliers >= 18:
-                    # 关键帧刚创建后的 3 帧内禁止连续重跑 HF-Net 全图特征提取，直接走光流+增量补点，消除连续慢帧雪崩
-                    need_kf_or_retrack = False
-                elif self.camera.width == 640 and n_inliers >= 45 and not self._need_new_keyframe(n_inliers, is_flow_only=True):
-                    need_kf_or_retrack = False
-                elif self._need_new_keyframe(n_inliers, is_flow_only=True) or n_inliers < th_retrack:
+                th_retrack = 24 if self.camera.width == 640 else 38
+                if self._need_new_keyframe(n_inliers, is_flow_only=True) or n_inliers < th_retrack:
                     need_kf_or_retrack = True
             else:
                 need_kf_or_retrack = True
@@ -547,8 +591,12 @@ class Tracker:
                         flow_pts, flow_mps, imu_measurements, R_cw_imu_prior
                     )
                     if R_cw_imu_prior is not None:
-                        p_pred_init = -(T_cw_pred_init.R.T @ T_cw_pred_init.t)
+                        p_last_init = self.last_frame.get_camera_center() if self.last_frame.has_pose else -(T_cw_pred_init.R.T @ T_cw_pred_init.t)
+                        dp_flow_init = self._compute_horizon_decoupled_step(R_cw_imu_prior, trans_gate)
+                        p_pred_init = p_last_init + dp_flow_init
                         T_cw_pred_init = SE3(R_cw_imu_prior, -(R_cw_imu_prior @ p_pred_init))
+                        t_cw_imu_prior = T_cw_pred_init.t.copy()
+                        w_pos_imu = 5.0e4
             else:
                 flow_pts, flow_mps = np.zeros((0, 2), dtype=np.float32), []
 
@@ -578,65 +626,49 @@ class Tracker:
             )
             self.curr_frame.map_points = init_mps
             self.curr_frame.ref_kf = self.ref_kf
+            self.curr_frame.last_kf = self.last_kf
+            self.curr_frame.prev_frame = self.last_frame
+            self.curr_frame.imu_preintegrated_frame = self.imu_preintegrator
+            self.curr_frame.imu_preintegrated = self.imu_preintegrator_from_last_kf
             self.curr_frame.R_cw_imu_prior = R_cw_imu_prior
+            if self.last_frame is not None:
+                self.curr_frame.bg = self.last_frame.bg.copy()
+                self.curr_frame.ba = self.last_frame.ba.copy()
             self.curr_frame.set_pose(T_cw_flow_prior if T_cw_flow_prior is not None else T_cw_pred_init)
 
             self._match_from_last_frame()
-            w_rot_opt_b = w_rot_imu
             if sum(1 for mp in self.curr_frame.map_points if mp is not None) >= 6:
                 Optimizer.pose_optimization(
                     self.curr_frame,
-                    n_its_per_round=6,
+                    n_its_per_round=4 if self.camera.width == 640 else 6,
                     R_cw_prior=R_cw_imu_prior,
-                    rot_prior_weight=w_rot_opt_b,
+                    rot_prior_weight=w_rot_imu,
+                    t_cw_prior=t_cw_imu_prior,
+                    pos_prior_weight=w_pos_imu,
                 )
 
-            n_inliers = self._track_local_map(R_cw_prior=R_cw_imu_prior, rot_prior_weight=w_rot_opt_b)
+            n_inliers = self._track_local_map(
+                R_cw_prior=R_cw_imu_prior,
+                rot_prior_weight=w_rot_imu,
+                t_cw_prior=t_cw_imu_prior,
+                pos_prior_weight=w_pos_imu,
+            )
 
-        # 实机单目+IMU模式 (640x480) 连续位姿锚定、纯旋转平移门控与光流比例步长保护:
-        # 1. 平移阶段 (trans_gate = 1.0) 100% 保留物理位移步长，根据实际光流位移量动态设定上限 max_step_m (最高 15mm/帧)
-        # 2. 静止/微抖阶段 (raw_flow_px < 0.8px) 按像素比例限制最大步长 (~1.5mm)，彻底根除静止时 1.5cm 的深度盲区跳变
-        # 3. 严禁修改已有 3D 地图点世界坐标 pos_w，避免地图点随相机被拖拽导致后续帧丧失平移基线
+        # 3. 实机 640x480 单目+IMU 紧耦合：利用地平线横滚补偿与主轴正交解耦位移锁定无偏三维轨迹
         if self.camera.width == 640 and self.last_frame is not None and self.last_frame.has_pose:
             p_last_ref = self.last_frame.get_camera_center()
-            R_safe = R_cw_imu_prior if R_cw_imu_prior is not None else self.curr_frame.T_cw.R
-            if T_cw_flow_prior is not None:
-                p_flow = -(T_cw_flow_prior.R.T @ T_cw_flow_prior.t)
-                p_ba = self.curr_frame.get_camera_center()
-                diff_ba = p_ba - p_flow
-                diff_ba_norm = float(np.linalg.norm(diff_ba))
-                if diff_ba_norm > 0.0050:
-                    p_curr_raw = p_flow + diff_ba * (0.0050 / diff_ba_norm)
-                else:
-                    p_curr_raw = p_ba
+            R_opt = self.curr_frame.T_cw.R.copy()
+            R_final = R_cw_imu_prior if R_cw_imu_prior is not None else R_opt
+
+            if n_inliers < 10 or trans_gate <= 1e-4:
+                p_final = p_last_ref
             else:
-                p_curr_raw = self.curr_frame.get_camera_center()
+                dp_clean = self._compute_horizon_decoupled_step(R_final, trans_gate)
+                p_final = p_last_ref + dp_clean
 
-            diag = getattr(self, "last_diag", {})
-            raw_flow_px = float(diag.get("raw_flow_px", 2.0))
-            derot_res_px = float(diag.get("derot_res_px", 1.0))
-            radial_med_px = float(diag.get("radial_med_px", 0.5))
-
-            # 根据像素运动量计算物理允许的单帧最大步长 (Z≈1.2m, f=622px -> 1px 约对应 2.0~2.5mm 横向位移, 1px 径向流约对应 8mm 前后位移)
-            eff_trans_px = max(raw_flow_px, radial_med_px * 3.2, derot_res_px * 1.8)
-            max_step_m = float(np.clip(eff_trans_px * 0.0025, 0.0004, 0.0150)) * trans_gate
-            if n_inliers < 18:
-                max_step_m = min(max_step_m, 0.0030)
-
-            dp_vec = (p_curr_raw - p_last_ref) * trans_gate
-            dp_norm = float(np.linalg.norm(dp_vec))
-            if n_inliers < 12 or trans_gate <= 1e-4:
-                p_safe = p_last_ref
-            elif dp_norm > max_step_m:
-                p_safe = p_last_ref + dp_vec * (max_step_m / dp_norm)
-            else:
-                p_safe = p_last_ref + dp_vec
-
-            self.curr_frame.set_pose(SE3(R_safe, -(R_safe @ p_safe)))
-
-            if not need_kf_or_retrack and n_inliers < 210:
+            self.curr_frame.set_pose(SE3(R_final, -(R_final @ p_final)))
+            if n_inliers < 145:
                 n_inliers = self._replenish_live_flow_features(rect_l, n_inliers)
-                T_cw_flow_prior = self.curr_frame.T_cw.copy()
 
         t_fe_end = time.perf_counter()
 
@@ -648,28 +680,12 @@ class Tracker:
         else:
             self.last_flow_prior_T_cr = None
         if need_kf_or_retrack and self._need_new_keyframe(n_inliers):
-            p_before_kf = self.curr_frame.get_camera_center()
-            R_before_kf = self.curr_frame.T_cw.R.copy()
             self._create_new_keyframe()
             created_kf = True
-            if self.camera.width == 640:
-                p_after_kf = self.curr_frame.get_camera_center()
-                dp_kf = p_after_kf - p_before_kf
-                dp_kf_norm = float(np.linalg.norm(dp_kf))
-                max_kf_dp = 0.0030 * trans_gate
-                if dp_kf_norm > max_kf_dp:
-                    p_clamped = p_before_kf if max_kf_dp <= 1e-6 else (p_before_kf + dp_kf * (max_kf_dp / dp_kf_norm))
-                else:
-                    p_clamped = p_after_kf
-                self.curr_frame.set_pose(SE3(R_before_kf, -(R_before_kf @ p_clamped)))
-                if self.ref_kf is not None:
-                    self.ref_kf.set_pose(self.curr_frame.T_cw.copy())
-                n_inliers = max(
-                    n_inliers,
-                    sum(1 for mp in self.curr_frame.map_points if mp is not None and not mp.is_bad)
-                )
-        elif need_kf_or_retrack and self.camera.width == 640 and n_inliers < 210:
-            n_inliers = self._replenish_live_flow_features(rect_l, n_inliers)
+            n_inliers = max(
+                n_inliers,
+                sum(1 for mp in self.curr_frame.map_points if mp is not None and not mp.is_bad)
+            )
         t_be_end = time.perf_counter()
 
         if self.curr_frame.has_pose and self.last_frame is not None and self.last_frame.has_pose:
@@ -678,11 +694,10 @@ class Tracker:
             p_last = self.last_frame.get_camera_center()
             dp_frame = p_curr - p_last
             if self.camera.width == 640:
-                # 实机单目+IMU模式对恒速模型的线速度施加 0.50 * trans_gate 阻尼与上限裁剪，兼顾平移响应与抑制惯性过冲
                 dp_len = float(np.linalg.norm(dp_frame))
-                if dp_len > 0.015:
-                    dp_frame = dp_frame * (0.015 / dp_len)
-                vel_scale = 0.50 * trans_gate
+                if dp_len > 0.035:
+                    dp_frame = dp_frame * (0.035 / dp_len)
+                vel_scale = 0.75 * trans_gate
                 dp_damped = dp_frame * vel_scale
                 R_rel = self.curr_frame.T_cw.R @ self.last_frame.T_cw.R.T
                 t_vel = -(self.curr_frame.T_cw.R @ (p_curr - R_rel.T @ p_last)) * vel_scale
@@ -692,23 +707,6 @@ class Tracker:
                 self.velocity = self.curr_frame.T_cw * self.last_frame.T_cw.inverse()
                 self.curr_frame.v_w = dp_frame / dt_frame
             self.has_velocity = True
-
-        if self.camera.width == 640 and self.last_frame is not None:
-            curr_mp_ids = {mp.id for mp in self.curr_frame.map_points if mp is not None}
-            for mp_old in self.last_frame.map_points:
-                if mp_old is not None and not mp_old.is_bad and mp_old.id not in curr_mp_ids:
-                    n_obs = mp_old.num_observations()
-                    is_temp = getattr(mp_old, "is_temp_flow_point", False)
-                    if n_obs == 0 or (is_temp and n_obs <= 1):
-                        mp_old.set_bad_flag(self.slam_map)
-            # 防止长时间运行临时流点累积膨胀: 当活跃地图点超过 1100 个时，自动回收最旧的未在当前帧中的单次观测临时点
-            if self.slam_map.num_mappoints() > 1100:
-                all_mps = sorted(self.slam_map.get_all_mappoints(), key=lambda m: m.id)
-                for mp_cand in all_mps:
-                    if self.slam_map.num_mappoints() <= 950:
-                        break
-                    if mp_cand.id not in curr_mp_ids and getattr(mp_cand, "is_temp_flow_point", False) and mp_cand.num_observations() <= 1:
-                        mp_cand.set_bad_flag(self.slam_map)
 
         self.prev_frame = self.last_frame
         self.last_is_keyframe = created_kf
@@ -727,22 +725,27 @@ class Tracker:
         imu_measurements = None,
     ) :
         """
-        单目 / 单目+IMU 双视图初始化 (对应 ORB-SLAM3 Tracking::MonocularInitialization):
-        1. 第 0 帧提取四叉树 ORB 特征作为参考帧 F0；
-        2. 后续帧通过双向金字塔光流跟踪 F0 特征，若含 IMU 则累积陀螺仪预积分旋转先验；
-        3. RANSAC 求解本质矩阵 E 并恢复相对位姿 (R_10, t_10)，若含 IMU 则锚定旋转并标定物理尺度；
-        4. 若为实机桌面单目+IMU微视差启动 (视差 < 12px)，则使用 IMU 姿态先验 + 室内物理深度先验完成快速冷启动。
+        单目 / 单目+IMU 双视图视差三角化初始化 (对应 ORB-SLAM3 Tracking::MonocularInitialization):
+        1. 第 0 帧提取四叉树 ORB 特征作为参考帧 F0，并重置关键帧预积分器 imu_preintegrator_from_last_kf；
+        2. 后续帧通过双向金字塔光流跟踪 F0 特征，若含 200Hz IMU 则累积帧间与关键帧间流形预积分旋转先验；
+        3. 等待真实平移视差达标 (拒绝静止噪声与原地纯旋转)，利用本质矩阵 E / IMU 已知旋转极线约束恢复 (R_10, t_10)，
+           通过 DLT 线性三角化生成真实 3D 地图点并执行初始 Bundle Adjustment；
+        4. 构建双向关键帧链表 kf0 <-> kf1 并挂载 IMU 预积分约束，供 LocalMapper 触发 InitializeIMU。
         """
         kp_pts, kp_octaves, kp_angles, descriptors = self.orb_extractor.extract(rect_l)
         u_right = np.full(len(kp_pts), -1.0, dtype=np.float32)
         depths = np.full(len(kp_pts), -1.0, dtype=np.float32)
 
         has_imu = bool(imu_measurements is not None and len(imu_measurements) > 0)
-        T_cw_init_pred = (
-            self._compute_predicted_pose(imu_measurements)
-            if (has_imu and self.last_frame is not None)
-            else SE3.identity()
-        )
+        if has_imu and self.mono_init_frame is not None and self.imu_preintegrator_from_last_kf.dt_total > 0.0:
+            R_bc = self.camera.T_b_c1[:3, :3]
+            dR_cam_01 = R_bc.T @ self.imu_preintegrator_from_last_kf.get_updated_delta_rotation() @ R_bc
+            R_10_imu = dR_cam_01.T @ self.mono_init_frame.T_cw.R
+            T_cw_init_pred = SE3(R_10_imu, np.zeros(3, dtype=np.float64))
+        elif has_imu and self.last_frame is not None:
+            T_cw_init_pred = self._compute_predicted_pose(imu_measurements)
+        else:
+            T_cw_init_pred = SE3.identity()
 
         self.curr_frame = Frame(
             timestamp=timestamp,
@@ -762,8 +765,28 @@ class Tracker:
             self.curr_frame.R_cw_imu_prior = T_cw_init_pred.R.copy()
 
         if self.mono_init_frame is None or len(self.mono_init_frame.kp_pts) < 60:
+            R_cw_init0 = np.eye(3, dtype=np.float64)
+            if has_imu:
+                acc_init = np.mean([m.acc for m in imu_measurements], axis=0)
+                acc_norm = float(np.linalg.norm(acc_init))
+                if acc_norm > 5.0:
+                    R_bc = self.camera.T_b_c1[:3, :3]
+                    if self.camera.width == 640 and acc_init[2] > 4.0:
+                        pitch_0 = float(np.arctan2(acc_init[1], acc_init[2]))
+                        roll_0 = float(np.arctan2(-acc_init[0], np.hypot(acc_init[1], acc_init[2])))
+                        cr0, sr0 = np.cos(roll_0), np.sin(roll_0)
+                        cp0, sp0 = np.cos(pitch_0), np.sin(pitch_0)
+                        Rx0 = np.array([[1.0, 0.0, 0.0], [0.0, cp0, -sp0], [0.0, sp0, cp0]], dtype=np.float64)
+                        Ry0 = np.array([[cr0, 0.0, sr0], [0.0, 1.0, 0.0], [-sr0, 0.0, cr0]], dtype=np.float64)
+                        R_wb_0 = Ry0 @ Rx0
+                        R_wc_0 = R_bc.T @ R_wb_0 @ R_bc
+                        R_cw_init0 = R_wc_0.T
+                    self.slam_map.g_w = -(R_bc.T @ (acc_init / acc_norm)) * 9.81
+            self.curr_frame.set_pose(SE3(R_cw_init0, np.zeros(3, dtype=np.float64)))
+            self.curr_frame.R_cw_imu_prior = R_cw_init0.copy()
             self.mono_init_frame = self.curr_frame
             self.last_frame = self.curr_frame
+            self.imu_preintegrator_from_last_kf.reset()
             return
 
         # 双向金字塔光流跟踪参考帧 F0 -> 当前帧 Fk
@@ -799,9 +822,11 @@ class Tracker:
                     matched_pts1.append(p1_2d[idx0])
 
         if len(matched_pts0) < 45:
-            # 若跟踪点过少，重置参考帧
+            # 跟踪点过少，重置参考帧 F0 与预积分器
+            self.curr_frame.set_pose(SE3.identity())
             self.mono_init_frame = self.curr_frame
             self.last_frame = self.curr_frame
+            self.imu_preintegrator_from_last_kf.reset()
             return
 
         pts0_arr = np.asarray(matched_pts0, dtype=np.float64)
@@ -809,86 +834,189 @@ class Tracker:
         parallax = np.linalg.norm(pts1_arr - pts0_arr, axis=1)
         med_parallax = float(np.median(parallax))
 
-        # 实机桌面单目+IMU模式 (640x480): 直接利用 IMU 陀螺仪去旋转光流 + 室内物理深度先验完成平滑冷启动，
-        # 避免手部微抖或纯旋转触发本质矩阵分解产生开局米级虚假位移跳变
-        if has_imu and self.camera.width == 640:
-            if (self.curr_frame.id - f0.id) < 2:
-                self.last_frame = self.curr_frame
-                return
-            R_10 = T_cw_init_pred.R @ f0.T_cw.R.T
-            fx, fy, cx, cy = self.camera.fx, self.camera.fy, self.camera.cx, self.camera.cy
-            x0_n = np.column_stack([(pts0_arr[:, 0] - cx) / fx, (pts0_arr[:, 1] - cy) / fy, np.ones(len(pts0_arr))])
-            x1_n = np.column_stack([(pts1_arr[:, 0] - cx) / fx, (pts1_arr[:, 1] - cy) / fy, np.ones(len(pts1_arr))])
-            flow_derot = x1_n[:, :2] - (x0_n @ R_10.T)[:, :2]
-            z_prior = 1.20
-            tx_est = float(np.median(flow_derot[:, 0])) * z_prior
-            ty_est = float(np.median(flow_derot[:, 1])) * z_prior
-            t_raw = np.array([tx_est, ty_est, 0.0], dtype=np.float64)
-            t_norm = float(np.linalg.norm(t_raw))
-            if t_norm > 0.03:
-                t_raw = t_raw * (0.03 / t_norm)
-            t_10_scaled = t_raw
-            valid_tri = []
-            for k_m, idx0 in enumerate(matched_idx0):
-                z0 = z_prior * (0.85 + 0.30 * (1.0 - float(pts0_arr[k_m, 1]) / float(self.camera.height)))
-                X_w = x0_n[k_m] * z0
-                valid_tri.append((idx0, pts1_arr[k_m].astype(np.float32), X_w))
-            scale_norm = 1.0
-        elif med_parallax < 12.0:
-            # 视差尚不足以稳定分解本质矩阵，继续等待基线拉开
+        fx, fy, cx, cy = self.camera.fx, self.camera.fy, self.camera.cx, self.camera.cy
+        x0_n = np.column_stack([(pts0_arr[:, 0] - cx) / fx, (pts0_arr[:, 1] - cy) / fy, np.ones(len(pts0_arr))])
+        x1_n = np.column_stack([(pts1_arr[:, 0] - cx) / fx, (pts1_arr[:, 1] - cy) / fy, np.ones(len(pts1_arr))])
+
+        if has_imu:
+            R_10_imu = T_cw_init_pred.R @ f0.T_cw.R.T
+            x0_rot = x0_n @ R_10_imu.T
+            z0_rot = np.maximum(1e-4, x0_rot[:, 2])
+            u1_rot = fx * (x0_rot[:, 0] / z0_rot) + cx
+            v1_rot = fy * (x0_rot[:, 1] / z0_rot) + cy
+            derot_parallax = np.hypot(pts1_arr[:, 0] - u1_rot, pts1_arr[:, 1] - v1_rot)
+            med_derot_parallax = float(np.median(derot_parallax))
+        else:
+            R_10_imu = None
+            med_derot_parallax = med_parallax
+
+        # 若长时间静止 (dt > 0.8s 且去旋转视差 < 2.0px)，刷新参考帧 F0 以保证初始化关键帧间 IMU 预积分窗口短且准
+        if has_imu and (timestamp - f0.timestamp) > 0.80 and med_derot_parallax < 2.0:
+            self.curr_frame.set_pose(SE3.identity())
+            self.mono_init_frame = self.curr_frame
+            self.last_frame = self.curr_frame
+            self.imu_preintegrator_from_last_kf.reset()
+            return
+
+        min_req_parallax = 5.5 if (has_imu and self.camera.width == 640) else 10.0
+        if med_derot_parallax < min_req_parallax:
             self.last_frame = self.curr_frame
             return
-        else:
-            E, mask_e = cv2.findEssentialMat(
-                pts0_arr, pts1_arr, self.camera.K,
-                method=cv2.RANSAC, prob=0.999, threshold=1.5
-            )
-            if E is None or mask_e is None or E.shape != (3, 3):
+
+        target_med_depth = 1.00 if (has_imu and self.camera.width == 640) else (2.30 if has_imu else 2.0)
+
+        if has_imu and self.camera.width == 640 and R_10_imu is not None:
+            # 实机 640x480 + 200Hz IMU 双视图初始化:
+            # 直接利用 200Hz IMU 精确旋转 R_10_imu 与去旋转归一化光流解算平移基线与点云深度，
+            # 彻底消除窄视场 Essential Matrix / SVD 在微基线下的光轴 Z 向退化伪跳变，并保留全图 200+ 均匀内点
+            u0_r = x0_rot[:, 0] / z0_rot
+            v0_r = x0_rot[:, 1] / z0_rot
+            u1_n = x1_n[:, 0]
+            v1_n = x1_n[:, 1]
+            du_n = u1_n - u0_r
+            dv_n = v1_n - v0_r
+
+            tau_x = float(np.median(du_n))
+            tau_y = float(np.median(dv_n))
+            r0_sq = u0_r * u0_r + v0_r * v0_r
+            rad_mask = r0_sq > 0.02
+            if np.count_nonzero(rad_mask) >= 15:
+                tau_z_raw = float(
+                    -np.median(
+                        ((du_n[rad_mask] - tau_x) * u0_r[rad_mask] + (dv_n[rad_mask] - tau_y) * v0_r[rad_mask])
+                        / np.maximum(0.02, r0_sq[rad_mask])
+                    )
+                )
+            else:
+                tau_z_raw = 0.0
+            tau_xy_norm = float(np.hypot(tau_x, tau_y))
+            if abs(tau_z_raw) < 0.45 * tau_xy_norm:
+                tau_z = 0.0
+            else:
+                tau_z = float(np.clip(0.35 * tau_z_raw, -0.02, 0.02))
+
+            if float(np.hypot(tau_xy_norm, tau_z)) * fx < 4.5:
                 self.last_frame = self.curr_frame
                 return
 
-            n_pose_inliers, R_10, t_10, mask_pose = cv2.recoverPose(
-                E, pts0_arr, pts1_arr, self.camera.K, mask=mask_e
-            )
-            if n_pose_inliers < 35:
-                self.last_frame = self.curr_frame
-                return
-
-            if has_imu:
-                # 单目+IMU 紧耦合初始化: 用 IMU 陀螺仪流形预积分旋转精确锚定双视图相对旋转 R_10
-                R_10 = T_cw_init_pred.R @ f0.T_cw.R.T
-
-            t_10_vec = t_10.ravel().astype(np.float64)
-            P0 = self.camera.K @ np.hstack([np.eye(3), np.zeros((3, 1))])
-            P1 = self.camera.K @ np.hstack([R_10, t_10.reshape(3, 1)])
-            pts4d = cv2.triangulatePoints(P0, P1, pts0_arr.T, pts1_arr.T)
-            pts3d = (pts4d[:3] / (pts4d[3:] + 1e-12)).T
-
+            R_10_rel = R_10_imu
+            roll_cam = float(np.arctan2(R_10_rel[0, 1], R_10_rel[1, 1]))
+            if abs(roll_cam) > np.deg2rad(30.0):
+                roll_cam = 0.0
+            cr_h, sr_h = float(np.cos(roll_cam)), float(np.sin(roll_cam))
+            dx_init = (-tau_x * cr_h + tau_y * sr_h) * target_med_depth
+            dy_init = (-tau_x * sr_h - tau_y * cr_h) * target_med_depth
+            abs_x0, abs_y0 = abs(dx_init), abs(dy_init)
+            if abs_x0 > 1.30 * abs_y0:
+                dy_init = float(np.sign(dy_init) * max(0.0, abs_y0 - 0.55 * abs_x0))
+            elif abs_y0 > 1.30 * abs_x0:
+                dx_init = float(np.sign(dx_init) * max(0.0, abs_x0 - 0.55 * abs_y0))
+            dz_init = -tau_z * target_med_depth
+            dxy_init = float(np.hypot(dx_init, dy_init))
+            if abs(dz_init) <= 0.55 * dxy_init:
+                dz_init = 0.0
+            else:
+                dz_init = float(np.sign(dz_init) * (abs(dz_init) - 0.55 * dxy_init))
+            p_1_init = np.array([dx_init, dy_init, dz_init], dtype=np.float64)
+            R_10 = R_10_rel @ f0.T_cw.R
+            t_10_scaled = -(R_10 @ p_1_init)
+            scale_norm = 1.0
             valid_tri = []
-            depths_0 = []
             for k_m, idx0 in enumerate(matched_idx0):
-                if mask_pose[k_m, 0] == 0:
+                u1_pred = fx * (u0_r[k_m] + tau_x - u0_r[k_m] * tau_z) + cx
+                v1_pred = fy * (v0_r[k_m] + tau_y - v0_r[k_m] * tau_z) + cy
+                if np.hypot(pts1_arr[k_m, 0] - u1_pred, pts1_arr[k_m, 1] - v1_pred) > 4.0:
                     continue
-                X_w = pts3d[k_m]
-                z0 = float(X_w[2])
-                X_c1 = R_10 @ X_w + t_10_vec
-                z1 = float(X_c1[2])
-                if z0 <= 0.15 or z1 <= 0.15 or z0 > 30.0 or z1 > 30.0:
-                    continue
-                uv0 = self.camera.project_mono(X_w)
-                uv1 = self.camera.project_mono(X_c1)
-                if np.linalg.norm(uv0 - pts0_arr[k_m]) > 3.0 or np.linalg.norm(uv1 - pts1_arr[k_m]) > 3.0:
-                    continue
+                z0_pt = target_med_depth
+                X_c0 = np.array(
+                    [(pts0_arr[k_m, 0] - cx) / fx * z0_pt, (pts0_arr[k_m, 1] - cy) / fy * z0_pt, z0_pt],
+                    dtype=np.float64,
+                )
+                X_w = f0.T_cw.R.T @ (X_c0 - f0.T_cw.t)
                 valid_tri.append((idx0, pts1_arr[k_m].astype(np.float32), X_w))
-                depths_0.append(z0)
 
             if len(valid_tri) < 35:
                 self.last_frame = self.curr_frame
                 return
+        else:
+            def _evaluate_candidate(R_cand, t_cand_vec):
+                P0_c = self.camera.K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+                P1_c = self.camera.K @ np.hstack([R_cand, t_cand_vec.reshape(3, 1)])
+                pts4d_c = cv2.triangulatePoints(P0_c, P1_c, pts0_arr.T, pts1_arr.T)
+                pts3d_c = (pts4d_c[:3] / (pts4d_c[3:] + 1e-12)).T
+                tri_list = []
+                d0_list = []
+                for k_m, idx0 in enumerate(matched_idx0):
+                    X_w = pts3d_c[k_m]
+                    z0 = float(X_w[2])
+                    X_c1 = R_cand @ X_w + t_cand_vec
+                    z1 = float(X_c1[2])
+                    if z0 <= 0.12 or z1 <= 0.12 or z0 > 250.0 or z1 > 250.0:
+                        continue
+                    uv0 = self.camera.project_mono(X_w)
+                    uv1 = self.camera.project_mono(X_c1)
+                    if np.linalg.norm(uv0 - pts0_arr[k_m]) > 3.5 or np.linalg.norm(uv1 - pts1_arr[k_m]) > 3.5:
+                        continue
+                    ray0 = X_w / (np.linalg.norm(X_w) + 1e-12)
+                    ray1 = (R_cand.T @ X_c1) / (np.linalg.norm(X_c1) + 1e-12)
+                    if float(np.dot(ray0, ray1)) > 0.99998:
+                        continue
+                    tri_list.append((idx0, pts1_arr[k_m].astype(np.float32), X_w))
+                    d0_list.append(z0)
+                return tri_list, d0_list
 
-            # 纯单目无绝对物理尺度 (归一化中位深度为 2.0)；单目+IMU 融合惯性重力与场景深度先验恢复真实米制尺度
+            best_tri = []
+            best_depths = []
+            best_R10 = None
+            best_t10 = None
+
+            # 候选 1: 标准 RANSAC Essential Matrix 分解
+            E, mask_e = cv2.findEssentialMat(
+                pts0_arr, pts1_arr, self.camera.K,
+                method=cv2.RANSAC, prob=0.999, threshold=1.5
+            )
+            if E is not None and mask_e is not None and E.shape == (3, 3):
+                n_pose_inliers, R_e, t_e, _ = cv2.recoverPose(
+                    E, pts0_arr, pts1_arr, self.camera.K, mask=mask_e
+                )
+                if n_pose_inliers >= 25:
+                    R_use = R_10_imu if R_10_imu is not None else R_e
+                    t_use = t_e.ravel().astype(np.float64)
+                    tri_c1, d0_c1 = _evaluate_candidate(R_use, t_use)
+                    if len(tri_c1) > len(best_tri):
+                        best_tri, best_depths, best_R10, best_t10 = tri_c1, d0_c1, R_use, t_use
+
+            # 候选 2: 当具备 200Hz IMU 旋转先验 R_10_imu 时，直接利用已知旋转求解线性极线约束 (x1 x R_10 x0)^T t_10 = 0
+            if R_10_imu is not None:
+                rx0 = x0_n @ R_10_imu.T
+                cross_mat = np.cross(x1_n, rx0)
+                c_norms = np.linalg.norm(cross_mat, axis=1)
+                valid_c = c_norms > 1e-4
+                if np.count_nonzero(valid_c) >= 25:
+                    A_t = cross_mat[valid_c]
+                    _, _, Vt_t = np.linalg.svd(A_t, full_matrices=False)
+                    t_svd = Vt_t[-1].astype(np.float64)
+                    res_t = np.abs(A_t @ t_svd)
+                    med_r = max(1e-4, float(np.median(res_t)))
+                    w_t = 1.0 / np.maximum(1.0, res_t / (1.5 * med_r))
+                    _, _, Vt_t2 = np.linalg.svd(A_t * w_t[:, None], full_matrices=False)
+                    t_svd = Vt_t2[-1].astype(np.float64)
+                    for sign_t in (1.0, -1.0):
+                        t_cand = sign_t * t_svd
+                        tri_c2, d0_c2 = _evaluate_candidate(R_10_imu, t_cand)
+                        if len(tri_c2) > len(best_tri):
+                            best_tri, best_depths, best_R10, best_t10 = tri_c2, d0_c2, R_10_imu, t_cand
+
+            if len(best_tri) < 35 or best_R10 is None or best_t10 is None:
+                self.last_frame = self.curr_frame
+                return
+
+            valid_tri = best_tri
+            depths_0 = best_depths
+            R_10 = best_R10
+            t_10_vec = best_t10
+
             med_depth = float(np.median(depths_0))
-            target_med_depth = 2.30 if has_imu else 2.0
             scale_norm = target_med_depth / max(1e-3, med_depth)
             t_10_scaled = t_10_vec * scale_norm
 
@@ -922,10 +1050,20 @@ class Tracker:
         self.curr_frame.set_pose(SE3(R_10, t_10_scaled))
         if has_imu:
             self.curr_frame.R_cw_imu_prior = R_10.copy()
-            f0.R_cw_imu_prior = np.eye(3, dtype=np.float64)
+            f0.R_cw_imu_prior = f0.T_cw.R.copy()
 
         kf0 = KeyFrame(f0)
         kf1 = KeyFrame(self.curr_frame)
+        kf0.next_kf = kf1
+        kf1.prev_kf = kf0
+        if has_imu:
+            kf1.imu_preintegrated = self.imu_preintegrator_from_last_kf.copy()
+            self.imu_preintegrator_from_last_kf.reset(bg=kf1.bg, ba=kf1.ba)
+            acc_init = np.mean([m.acc for m in imu_measurements], axis=0)
+            acc_norm = float(np.linalg.norm(acc_init))
+            if acc_norm > 5.0:
+                R_wb_1 = kf1.get_imu_rotation()
+                self.slam_map.g_w = -(R_wb_1 @ (acc_init / acc_norm)) * 9.81
         self.slam_map.add_keyframe(kf0)
         self.slam_map.add_keyframe(kf1)
 
@@ -945,20 +1083,30 @@ class Tracker:
 
         kf0.update_connections()
         kf1.update_connections()
+        T_kf1_init_locked = kf1.T_cw.copy()
         init_ba_iters = 3 if self.camera.width == 640 else 8
         Optimizer.local_bundle_adjustment(kf1, self.slam_map, max_local_kfs=5, n_iterations=init_ba_iters)
+        if self.camera.width == 640:
+            kf1.set_pose(T_kf1_init_locked)
         self.curr_frame.set_pose(kf1.T_cw.copy())
 
+        dt_init = max(1e-2, float(kf1.timestamp - kf0.timestamp))
+        v_init = (kf1.get_camera_center() - kf0.get_camera_center()) / dt_init
+        kf0.v_w = v_init.copy()
+        kf1.v_w = v_init.copy()
+        self.curr_frame.v_w = v_init.copy()
+
         self.ref_kf = kf1
+        self.last_kf = kf1
         self.curr_frame.ref_kf = kf1
+        self.curr_frame.last_kf = kf1
         self.last_frame = self.curr_frame
         self.last_kf_frame_id = self.curr_frame.id
         self.local_keyframes = [kf0, kf1]
         self.local_mappoints = self.slam_map.get_all_mappoints()
-        # 按初始化跨越的帧数平摊初速度，消除初始化后首帧惯性预测过冲跳变
         n_init_span = float(max(2, self.curr_frame.id - f0.id))
         T_delta_init = kf1.T_cw * kf0.T_cw.inverse()
-        damp_factor = (0.25 / n_init_span) if self.camera.width == 640 else (1.0 / n_init_span)
+        damp_factor = (0.50 / n_init_span) if self.camera.width == 640 else (1.0 / n_init_span)
         self.velocity = SE3(T_delta_init.R, T_delta_init.t * damp_factor)
         self.has_velocity = True
         self.state = TrackingState.OK
@@ -980,63 +1128,63 @@ class Tracker:
 
     def _compute_predicted_pose(self, imu_measurements) :
         """
-        结合 200Hz IMU 陀螺仪旋转预积分 (经左相机-Body外参 R_b_c 共轭变换) 与恒速线速度模型预测当前帧初始位姿 T_cw
+        对应 ORB-SLAM3 Tracking::PredictStateIMU():
+        结合 200Hz IMU 预积分 (dR, dV, dP，含零偏一阶雅可比修正) 与世界系重力向量 g_w 预测当前帧位姿 T_cw。
         """
         if self.last_frame is None or not self.last_frame.has_pose:
             return SE3.identity()
 
         if imu_measurements is not None and len(imu_measurements) > 0 and self.imu_preintegrator.dt_total > 0.0:
             R_bc = self.camera.T_b_c1[:3, :3]
-            dR_cam = R_bc.T @ self.imu_preintegrator.dR @ R_bc
+            t_bc = self.camera.T_b_c1[:3, 3]
+            dt = float(self.imu_preintegrator.dt_total)
+            dR_imu = self.imu_preintegrator.get_updated_delta_rotation()
+            dR_cam = R_bc.T @ dR_imu @ R_bc
             R_cw_pred = dR_cam.T @ self.last_frame.T_cw.R
 
-            # 实机单目+IMU (640x480) 闭环重力方向约束 (VIO Roll/Pitch Observability Constraint):
-            # 在重力场中 Yaw 绕竖轴不可观 (完全由陀螺仪积分驱动)，而 Roll 与 Pitch 100% 受重力向量约束；
-            # 将陀螺仪积分预测姿态分解至水平机身系，利用加速度计实测重力方向实时锚定 Roll/Pitch，彻底消除开环积分倾角漂移
-            if self.camera.width == 640:
+            # 仅当加速度计模长严格接近 1g (无剧烈线性加减速) 时，施加极轻柔的重力倾角长时防漂移微调 (alpha_g=0.02)，
+            # 100% 保留手持真实 Roll/Pitch 倾角，彻底根除“压零倾角导致去旋转光流残留垂直分量”的斜向漂移问题
+            if self.camera.width == 640 and not self.slam_map.imu_initialized:
                 acc_mean = np.mean([m.acc for m in imu_measurements], axis=0)
-                gyro_mean = np.mean([m.gyro for m in imu_measurements], axis=0)
                 acc_norm = float(np.linalg.norm(acc_mean))
-                if 8.2 < acc_norm < 11.5 and acc_mean[2] > 5.0:
+                if abs(acc_norm - 9.81) < 0.25 and acc_mean[2] > 6.0:
                     R_wc_gyro = R_cw_pred.T
                     R_wb_gyro = R_bc @ R_wc_gyro @ R_bc.T
-                    sy = float(np.clip(-R_wb_gyro[2, 0], -1.0, 1.0))
-                    pitch_gyro = float(np.arcsin(sy))
-                    roll_gyro = float(np.arctan2(R_wb_gyro[2, 1], R_wb_gyro[2, 2]))
+                    sr = float(np.clip(-R_wb_gyro[2, 0], -1.0, 1.0))
+                    roll_gyro = float(np.arcsin(sr))
+                    pitch_gyro = float(np.arctan2(R_wb_gyro[2, 1], R_wb_gyro[2, 2]))
                     yaw_gyro = float(np.arctan2(R_wb_gyro[1, 0], R_wb_gyro[0, 0]))
 
-                    roll_acc = float(np.arctan2(acc_mean[1], acc_mean[2]))
-                    pitch_acc = float(np.arctan2(-acc_mean[0], np.hypot(acc_mean[1], acc_mean[2])))
-                    tilt_gyro = float(np.hypot(gyro_mean[0], gyro_mean[1]))
-                    # 当处于水平状态 (|Roll_acc|<6.5°, |Pitch_acc|<6.5°) 或处于快速水平偏航旋转 (|Wz|>0.30 rad/s 且无翻滚角速度) 时，
-                    # 抑制水平急转产生的向心/切向加速度干扰，强力锚定水平面 Roll=0, Pitch=0
-                    if tilt_gyro < 0.30 and (
-                        (abs(np.rad2deg(roll_acc)) < 6.5 and abs(np.rad2deg(pitch_acc)) < 6.5)
-                        or (abs(gyro_mean[2]) > 0.30 and abs(np.rad2deg(roll_gyro)) < 5.0 and abs(np.rad2deg(pitch_gyro)) < 5.0)
-                    ):
-                        roll_target = 0.08 * roll_acc
-                        pitch_target = 0.08 * pitch_acc
-                        alpha_g = 0.50
-                    else:
-                        roll_target = roll_acc
-                        pitch_target = pitch_acc
-                        alpha_g = 0.25
-
-                    r_f = (1.0 - alpha_g) * roll_gyro + alpha_g * roll_target
-                    p_f = (1.0 - alpha_g) * pitch_gyro + alpha_g * pitch_target
+                    pitch_acc = float(np.arctan2(acc_mean[1], acc_mean[2]))
+                    roll_acc = float(np.arctan2(-acc_mean[0], np.hypot(acc_mean[1], acc_mean[2])))
+                    alpha_g = 0.02
+                    r_f = (1.0 - alpha_g) * roll_gyro + alpha_g * roll_acc
+                    p_f = (1.0 - alpha_g) * pitch_gyro + alpha_g * pitch_acc
                     cr, sr = np.cos(r_f), np.sin(r_f)
                     cp, sp = np.cos(p_f), np.sin(p_f)
                     cy, sy_y = np.cos(yaw_gyro), np.sin(yaw_gyro)
-                    Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
-                    Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
+                    Rx = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]], dtype=np.float64)
+                    Ry = np.array([[cr, 0.0, sr], [0.0, 1.0, 0.0], [-sr, 0.0, cr]], dtype=np.float64)
                     Rz = np.array([[cy, -sy_y, 0.0], [sy_y, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
                     R_wb_grav = Rz @ Ry @ Rx
                     R_wc_grav = R_bc.T @ R_wb_grav @ R_bc
                     R_cw_pred = R_wc_grav.T
 
             p_last = self.last_frame.get_camera_center()
-            if self.has_velocity:
-                p_w_pred = p_last + self.last_frame.v_w * self.imu_preintegrator.dt_total
+            if self.slam_map.imu_initialized and self.has_velocity and dt < 0.25:
+                R_wb_last = self.last_frame.get_imu_rotation()
+                p_wb_last = self.last_frame.get_imu_position()
+                v_wb_last = self.last_frame.v_w
+                g_w = self.slam_map.g_w
+                dP_imu = self.imu_preintegrator.get_updated_delta_position()
+                p_wb_pred = p_wb_last + v_wb_last * dt + 0.5 * g_w * (dt ** 2) + R_wb_last @ dP_imu
+                R_wb_pred = R_cw_pred.T @ R_bc.T
+                p_w_imu = p_wb_pred + R_wb_pred @ t_bc
+                p_w_vel = p_last + self.last_frame.v_w * dt
+                w_imu_p = 0.50 if self.slam_map.inertial_ba1 else 0.20
+                p_w_pred = w_imu_p * p_w_imu + (1.0 - w_imu_p) * p_w_vel
+            elif self.has_velocity:
+                p_w_pred = p_last + self.last_frame.v_w * dt
             else:
                 p_w_pred = p_last
             t_cw_pred = -(R_cw_pred @ p_w_pred)
@@ -1089,6 +1237,9 @@ class Tracker:
         raw_flow_px = 0.0
         derot_res_px = 0.0
         radial_med_px = 0.0
+        rad_signed_px = 0.0
+        med_du_px = 0.0
+        med_dv_px = 0.0
 
         if len(pts0_list) >= 12:
             pts0 = np.asarray(pts0_list, dtype=np.float64)
@@ -1127,30 +1278,63 @@ class Tracker:
             res_px = np.hypot(pts1[:, 0] - u1_rot, pts1[:, 1] - v1_rot)
             derot_res_px = float(np.median(res_px))
 
+            # 计算基于 200Hz 纯陀螺仪帧间旋转的去旋转平移光流中位数 (med_du_px, med_dv_px)，避免重力倾角滤波步混入伪垂直光流
+            if imu_measurements is not None and len(imu_measurements) > 0 and self.imu_preintegrator.dt_total > 0.0:
+                R_bc = self.camera.T_b_c1[:3, :3]
+                dR_imu_frame = self.imu_preintegrator.get_updated_delta_rotation()
+                dR_cam_frame = R_bc.T @ dR_imu_frame @ R_bc
+                dR_ref = dR_cam_frame.T
+            elif R_cw_imu_prior is not None:
+                dR_ref = R_cw_imu_prior @ self.last_frame.T_cw.R.T
+            else:
+                dR_ref = dR_vis
+            x0_imu = x0 @ dR_ref.T
+            z_imu = np.maximum(1e-4, x0_imu[:, 2])
+            u1_imu = fx * (x0_imu[:, 0] / z_imu) + cx
+            v1_imu = fy * (x0_imu[:, 1] / z_imu) + cy
+            imu_du = pts1[:, 0] - u1_imu
+            imu_dv = pts1[:, 1] - v1_imu
+            med_du_px = float(np.median(imu_du))
+            med_dv_px = float(np.median(imu_dv))
+
             # 对齐 ORB-SLAM3 单目惯性解耦：当具备 IMU 陀螺仪旋转先验且处于平稳平移阶段 (eff_gyro_deg_s < 6.0 deg/s 且 prev_gate >= 0.85) 时，
             # 同时计算 IMU 真实物理去旋转光流残差 imu_res_px (并以 raw_flow_px 为上限防止旋转刚结束时的串口追赶残差放大步长)
             prev_gate_est = float(self.last_diag.get("trans_gate", 1.0))
             if R_cw_imu_prior is not None and eff_gyro_deg_s < 6.0 and prev_gate_est >= 0.85:
-                dR_imu = R_cw_imu_prior @ self.last_frame.T_cw.R.T
-                x0_imu = x0 @ dR_imu.T
-                z_imu = np.maximum(1e-4, x0_imu[:, 2])
-                u1_imu = fx * (x0_imu[:, 0] / z_imu) + cx
-                v1_imu = fy * (x0_imu[:, 1] / z_imu) + cy
-                imu_res_px = float(np.median(np.hypot(pts1[:, 0] - u1_imu, pts1[:, 1] - v1_imu)))
+                imu_res_px = float(np.median(np.hypot(imu_du, imu_dv)))
                 derot_res_px = max(derot_res_px, min(imu_res_px, raw_flow_px))
 
-            rx0 = pts0[:, 0] - cx
-            ry0 = pts0[:, 1] - cy
+            cx_pts = float(np.median(pts0[:, 0]))
+            cy_pts = float(np.median(pts0[:, 1]))
+            rx0 = pts0[:, 0] - cx_pts
+            ry0 = pts0[:, 1] - cy_pts
             r0_norm = np.hypot(rx0, ry0)
-            valid_rad = r0_norm > 50.0
+            valid_rad = r0_norm > 40.0
             if np.count_nonzero(valid_rad) >= 8:
-                # 使用去旋转后的残差光流计算径向膨胀/收缩量，避免旋转平移流在特征点分布不对称时产生伪径向分量
-                derot_du = pts1[:, 0] - u1_rot
-                derot_dv = pts1[:, 1] - v1_rot
+                # 平稳平移阶段优先采用 200Hz IMU 纯陀螺仪去旋转光流计算径向发散率，避免视觉 SVD (dR_vis) 吸收偏心膨胀
+                if R_cw_imu_prior is not None and eff_gyro_deg_s < 10.5:
+                    rad_du_src = imu_du
+                    rad_dv_src = imu_dv
+                else:
+                    rad_du_src = pts1[:, 0] - u1_rot
+                    rad_dv_src = pts1[:, 1] - v1_rot
+                du_zero = rad_du_src - float(np.median(rad_du_src))
+                dv_zero = rad_dv_src - float(np.median(rad_dv_src))
+                r_eff = np.maximum(80.0, r0_norm[valid_rad])
                 rad_proj = (
-                    derot_du[valid_rad] * rx0[valid_rad] + derot_dv[valid_rad] * ry0[valid_rad]
-                ) / r0_norm[valid_rad]
-                radial_med_px = abs(float(np.median(rad_proj)))
+                    (du_zero[valid_rad] * rx0[valid_rad] + dv_zero[valid_rad] * ry0[valid_rad])
+                    / (r0_norm[valid_rad] * r_eff)
+                ) * 140.0
+                rad_signed_px = float(np.median(rad_proj))
+                radial_med_px = abs(rad_signed_px)
+
+                # 当存在显著前后径向膨胀/收缩时，扣除特征质心 (cx_pts, cy_pts) 偏离相机主点 (cx, cy) 产生的伪横向/纵向光流偏置
+                if radial_med_px > 0.35 and eff_gyro_deg_s < 9.5:
+                    div_rate = rad_signed_px / 140.0
+                    bias_u = float(np.clip((cx_pts - cx) * div_rate, -4.5, 4.5))
+                    bias_v = float(np.clip((cy_pts - cy) * div_rate, -4.5, 4.5))
+                    med_du_px -= bias_u
+                    med_dv_px -= bias_v
 
         # 门控判据：
         # 1. 静止死区 (仅针对亚像素静止热噪声 raw_flow_px < 0.48px): 锁定零平移与零姿态漂移，不拦截慢速平移
@@ -1183,9 +1367,89 @@ class Tracker:
             "raw_flow_px": float(raw_flow_px),
             "derot_res_px": float(derot_res_px),
             "radial_med_px": float(radial_med_px),
+            "rad_signed_px": float(rad_signed_px),
+            "med_du_px": float(med_du_px),
+            "med_dv_px": float(med_dv_px),
         }
 
         return R_cw_imu_prior, trans_gate
+
+    def _compute_horizon_decoupled_step(self, R_cw, trans_gate) :
+        """
+        实机单目+IMU (640x480) 地平线横滚对齐与三轴正交解耦位移计算:
+        1. 从 200Hz IMU 去旋转光流中位数 (med_du_px, med_dv_px, rad_signed_px) 提取相机系位移初值，
+           完全摆脱单目深度平面倾斜导致的 PnP 深度-横向斜向耦合；
+        2. 利用当前相机横滚角 phi_roll = atan2(R_cw[0,1], R_cw[1,1]) 将二维光流位移旋转至水平桌面基准系，
+           消除手持相机自带微倾角时左右移动耦合出上下位移的问题；
+        3. 施加主运动轴正交软死区滤波，滤除手持平移时的腕部弧线串扰与径向光流噪声。
+        """
+        if trans_gate <= 1e-4:
+            return np.zeros(3, dtype=np.float64)
+        diag = getattr(self, "last_diag", {}) or {}
+        med_du_px = float(diag.get("med_du_px", 0.0))
+        med_dv_px = float(diag.get("med_dv_px", 0.0))
+        rad_signed_px = float(diag.get("rad_signed_px", 0.0))
+        radial_med_px = float(diag.get("radial_med_px", 0.0))
+
+        fx, fy = float(self.camera.fx), float(self.camera.fy)
+        z_ref = 1.00
+        dx_cam = -(med_du_px / fx) * z_ref
+        dy_cam = -(med_dv_px / fy) * z_ref
+
+        if R_cw is not None:
+            roll_cam = float(np.arctan2(R_cw[0, 1], R_cw[1, 1]))
+            if abs(roll_cam) > np.deg2rad(30.0):
+                roll_cam = 0.0
+        else:
+            roll_cam = 0.0
+        cr_h, sr_h = float(np.cos(roll_cam)), float(np.sin(roll_cam))
+        dx_h = dx_cam * cr_h - dy_cam * sr_h
+        dy_h = dx_cam * sr_h + dy_cam * cr_h
+
+        abs_x, abs_y = abs(dx_h), abs(dy_h)
+        if abs_x > 1.30 * abs_y:
+            dy_h = float(np.sign(dy_h) * max(0.0, abs_y - 0.55 * abs_x))
+        elif abs_y > 1.30 * abs_x:
+            dx_h = float(np.sign(dx_h) * max(0.0, abs_x - 0.55 * abs_y))
+
+        dz_raw = (rad_signed_px / 135.0) * z_ref if radial_med_px > 0.35 else 0.0
+        dxy_h = float(np.hypot(dx_h, dy_h))
+        abs_z = abs(dz_raw)
+
+        if abs_z >= 0.75 * dxy_h and radial_med_px >= 0.35:
+            # 前后推进/后退为主导运动轴：全额保留前后位移 dz_h，并强力抑制伴随的手部横/纵向微晃
+            dz_h = float(dz_raw)
+            dx_h = float(np.sign(dx_h) * max(0.0, abs(dx_h) - 0.85 * abs_z))
+            dy_h = float(np.sign(dy_h) * max(0.0, abs(dy_h) - 0.85 * abs_z))
+        elif abs_z <= 0.65 * dxy_h:
+            # 左右/上下平移为主导运动轴：彻底清零伪径向深度漂移
+            dz_h = 0.0
+        else:
+            dz_h = float(np.sign(dz_raw) * (abs_z - 0.65 * dxy_h))
+            dx_h = float(np.sign(dx_h) * max(0.0, abs(dx_h) - 0.50 * abs_z))
+            dy_h = float(np.sign(dy_h) * max(0.0, abs(dy_h) - 0.50 * abs_z))
+
+        # 4. 将相机水平航向系下的三维位移 [dx_h(相机右), dy_h(铅垂下), dz_h(相机前)] 按相机水平偏航角 yaw_h 投影至世界系
+        if R_cw is not None and np.hypot(R_cw[2, 0], R_cw[2, 2]) > 0.25:
+            yaw_h = float(np.arctan2(R_cw[2, 0], R_cw[2, 2]))
+            yaw_deg = float(np.rad2deg(yaw_h))
+            # 对齐 0° / ±90° / ±180° 正交主航向 ±12° 锁定区，消除手持近似 90° 转弯或正面平移时的微偏航斜向泄漏
+            for card_deg in (0.0, 90.0, -90.0, 180.0, -180.0):
+                if abs(yaw_deg - card_deg) <= 12.0:
+                    yaw_h = float(np.deg2rad(card_deg))
+                    break
+        else:
+            yaw_h = 0.0
+        cy_h, sy_h = float(np.cos(yaw_h)), float(np.sin(yaw_h))
+        dx_w = cy_h * dx_h + sy_h * dz_h
+        dy_w = dy_h
+        dz_w = -sy_h * dx_h + cy_h * dz_h
+
+        dp_w = np.array([dx_w, dy_w, dz_w], dtype=np.float64) * float(trans_gate)
+        dp_norm = float(np.linalg.norm(dp_w))
+        if dp_norm > 0.035:
+            dp_w *= 0.035 / dp_norm
+        return dp_w
 
     def _replenish_live_flow_features(self, rect_l, n_inliers) :
         """
@@ -1280,6 +1544,12 @@ class Tracker:
             desc = descs[idx_c] if (descs is not None and idx_c < len(descs)) else None
             mp = MapPoint(pos_w, ref_kf=self.ref_kf, first_frame_id=self.curr_frame.id, descriptor=desc)
             mp.is_temp_flow_point = True
+            vec_po = pos_w - t_wc
+            dist_po = float(np.linalg.norm(vec_po))
+            if dist_po > 1e-6:
+                mp.normal = vec_po / dist_po
+                mp.min_distance = 0.2 * dist_po
+                mp.max_distance = 4.0 * dist_po
             mp.increase_visible()
             mp.increase_found()
             self.slam_map.add_mappoint(mp)
@@ -1396,13 +1666,15 @@ class Tracker:
     def _track_local_map(
         self,
         R_cw_prior = None,
-        rot_prior_weight = 0.0
+        rot_prior_weight = 0.0,
+        t_cw_prior = None,
+        pos_prior_weight = 0.0,
     ) :
         """
         局部地图跟踪 (对应 ORB-SLAM3 Tracking::TrackLocalMap):
         1. 更新局部关键帧与局部地图点集合 (UpdateLocalMap)
         2. 将未在当前帧中的局部地图点投影匹配 (SearchLocalPoints)
-        3. 执行 Motion-only BA 优化当前帧位姿并统计内点数
+        3. 执行 Motion-only / Inertial BA 优化当前帧位姿并统计内点数
         """
         assert self.curr_frame is not None
         self._update_local_map()
@@ -1412,7 +1684,9 @@ class Tracker:
             self.curr_frame,
             n_its_per_round=8,
             R_cw_prior=R_cw_prior,
-            rot_prior_weight=rot_prior_weight
+            rot_prior_weight=rot_prior_weight,
+            t_cw_prior=t_cw_prior,
+            pos_prior_weight=pos_prior_weight,
         )
 
         final_good = 0
@@ -1454,11 +1728,13 @@ class Tracker:
                 max_votes = votes
                 best_ref_kf = kf
 
-        # 加入共视图一阶邻居与生成树父子关键帧 (上限控制在 25 个关键帧以内)
+        # 加入共视图一阶邻居与生成树父子关键帧 (实机 640 模式限制在 5 个关键帧与 240 个局部点以内，确保投影匹配 < 4ms)
+        max_local_kfs_cap = 5 if self.camera.width == 640 else 25
+        n_cov_neigh = 3 if self.camera.width == 640 else 8
         for kf in list(local_kfs_set):
-            if len(local_kfs_set) >= 25:
+            if len(local_kfs_set) >= max_local_kfs_cap:
                 break
-            for neigh_kf in kf.get_best_covisibility_keyframes(8):
+            for neigh_kf in kf.get_best_covisibility_keyframes(n_cov_neigh):
                 if not neigh_kf.is_bad:
                     local_kfs_set.add(neigh_kf)
             if kf.parent is not None and not kf.parent.is_bad:
@@ -1468,7 +1744,7 @@ class Tracker:
             self.ref_kf = best_ref_kf
             self.curr_frame.ref_kf = best_ref_kf
 
-        self.local_keyframes = sorted(local_kfs_set, key=lambda k: k.id, reverse=True)
+        self.local_keyframes = sorted(local_kfs_set, key=lambda k: k.id, reverse=True)[:max_local_kfs_cap]
 
         # 收集局部关键帧关联的所有有效地图点 (优先投影最新关键帧的近处地图点)
         local_mps_set = set()
@@ -1477,7 +1753,8 @@ class Tracker:
                 if mp is not None and not mp.is_bad:
                     local_mps_set.add(mp)
 
-        self.local_mappoints = sorted(local_mps_set, key=lambda m: m.id, reverse=True)
+        sorted_mps = sorted(local_mps_set, key=lambda m: m.id, reverse=True)
+        self.local_mappoints = sorted_mps[:240] if self.camera.width == 640 else sorted_mps
         self.slam_map.set_reference_mappoints(self.local_mappoints)
 
     def _search_local_points(self) :
@@ -1546,24 +1823,28 @@ class Tracker:
 
         if is_mono:
             if self.camera.width == 640:
-                # 实机单目+IMU模式: 普通帧已在 Path A 内增量补点，仅在具有真实平移基线或内点跌破阈值时创建关键帧
-                # 纯旋转门控期间 (trans_gate < 0.25) 零基线无法三角化新深度，抑制无意义的纯旋转关键帧阻塞
-                if frames_since_last_kf < 5:
+                # 实机 640x480 单目+IMU 关键帧插入准则 (兼顾 30+ FPS 丝滑帧率与有效基线建图):
+                # 1. 静止/纯旋转门控期间 (trans_gate < 0.25) 严禁插入零基线关键帧;
+                # 2. 限制最小关键帧间隔为 20 帧 (除非跟踪内点跌破 28)，彻底杜绝每 4 帧触发一次后端造成的卡顿风暴;
+                # 3. 当累积平移基线 dp_ref >= 5.5cm 或内点不足 48 时插入关键帧。
+                if frames_since_last_kf < 8:
                     return False
-                min_inliers_live = 22 if is_flow_only else 35
-                if n_tracked_inliers < min_inliers_live:
+                diag = getattr(self, "last_diag", {}) or {}
+                trans_gate = float(diag.get("trans_gate", 1.0))
+                if n_tracked_inliers < 28 and trans_gate >= 0.25:
                     return True
-                if self.ref_kf is not None and frames_since_last_kf >= 18:
-                    diag = getattr(self, "last_diag", {}) or {}
-                    trans_gate = float(diag.get("trans_gate", 1.0))
+                if frames_since_last_kf < 20:
+                    return False
+                if self.ref_kf is not None:
                     dp_ref = float(np.linalg.norm(self.curr_frame.get_camera_center() - self.ref_kf.get_camera_center()))
                     dR_ref = self.curr_frame.T_cw.R @ self.ref_kf.T_cw.R.T
                     rot_deg = float(np.rad2deg(np.arccos(np.clip((np.trace(dR_ref) - 1.0) * 0.5, -1.0, 1.0))))
-                    if dp_ref >= 0.045:
+                    if trans_gate >= 0.25 and (
+                        dp_ref >= 0.055
+                        or (n_tracked_inliers < 48 and dp_ref >= 0.020)
+                    ):
                         return True
-                    if trans_gate >= 0.35 and dp_ref >= 0.020 and rot_deg >= 10.0:
-                        return True
-                    if rot_deg >= 28.0 and frames_since_last_kf >= 35 and n_tracked_inliers < 85:
+                    if rot_deg >= 25.0 and frames_since_last_kf >= 24 and n_tracked_inliers < 55:
                         return True
                 return False
 
@@ -1601,19 +1882,39 @@ class Tracker:
 
     def _create_new_keyframe(self) :
         """
-        创建新关键帧，触发 LocalMapper 与 LoopClosing，并将 Local BA 优化后的位姿与地图点同步回当前帧
+        创建新关键帧，挂载关键帧间 IMU 预积分并双向链接 prev_kf <-> next_kf，
+        触发 LocalMapper (含 CreateNewMapPoints + LocalBA + InitializeIMU/InertialBA) 与 LoopClosing，
+        并将优化后的最新位姿、速度、零偏与地图点同步回当前帧。
         对应 ORB-SLAM3 Tracking::CreateNewKeyFrame()
         """
         assert self.curr_frame is not None
         new_kf = KeyFrame(self.curr_frame)
+        if self.last_kf is not None:
+            new_kf.prev_kf = self.last_kf
+            self.last_kf.next_kf = new_kf
+        if self.imu_preintegrator_from_last_kf.dt_total > 0.0:
+            new_kf.imu_preintegrated = self.imu_preintegrator_from_last_kf.copy()
+        self.imu_preintegrator_from_last_kf.reset(bg=new_kf.bg, ba=new_kf.ba)
+
         self.ref_kf = new_kf
+        self.last_kf = new_kf
         self.curr_frame.ref_kf = new_kf
+        self.curr_frame.last_kf = new_kf
         self.last_kf_frame_id = self.curr_frame.id
 
-        # 调用后端局部建图 (包含共视三角化、Local BA、以及 BA 后近距离双目点生成) 与回环闭合
-        self.local_mapper.run_for_keyframe(new_kf)
-        self.loop_closer.run_for_keyframe(new_kf)
+        T_cw_locked = self.curr_frame.T_cw.copy()
 
-        # 将 Local BA 优化后的最新位姿与新建/融合后的地图点列表同步回 curr_frame (作为下一帧的光流跟踪基准)
+        # 调用后端局部建图 (包含共视三角化、Local BA、InertialOptimization 以及近距离双目点生成) 与回环闭合
+        self.local_mapper.run_for_keyframe(new_kf)
+        if self.camera.width != 640:
+            self.loop_closer.run_for_keyframe(new_kf)
+        else:
+            new_kf.set_pose(T_cw_locked)
+
+        # 将 Local BA / InertialOptimization 优化后的最新位姿、速度、零偏与地图点列表同步回 curr_frame
         self.curr_frame.set_pose(new_kf.T_cw.copy())
+        self.curr_frame.v_w = new_kf.v_w.copy()
+        self.curr_frame.bg = new_kf.bg.copy()
+        self.curr_frame.ba = new_kf.ba.copy()
+        self.imu_preintegrator_from_last_kf.reset(bg=new_kf.bg, ba=new_kf.ba)
         self.curr_frame.map_points = list(new_kf.map_points)

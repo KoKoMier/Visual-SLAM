@@ -38,7 +38,7 @@ class SLAMSystem:
         n_features = 600,
         max_local_kfs = 8,
         use_hybrid_optical_flow = True,
-        use_hfnet = True,
+        use_hfnet = False,
         hfnet_root = None,
     ):
         self.camera = camera

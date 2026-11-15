@@ -145,17 +145,21 @@ class BlackboxLogger:
 
     @staticmethod
     def _rot_to_euler_deg(R_wc) :
-        """将相机光学坐标系旋转矩阵 R_wc (X右, Y下, Z前) 转换为水平机身系 ZYX 姿态角 (Roll, Pitch, Yaw, 与 IMU 严格对齐)"""
+        """将相机光学坐标系旋转矩阵 R_wc (X右, Y下, Z前) 转换为水平机身系 (X右, Y前, Z上) 姿态角 (Roll, Pitch, Yaw, 与 IMU 严格对齐):
+        - Roll : 绕 +Y(前/光轴) 旋转 (横滚角)
+        - Pitch: 绕 +X(右)      旋转 (俯仰角，上抬抬头为正)
+        - Yaw  : 绕 +Z(上)      旋转 (偏航角)
+        """
         R_bc = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]], dtype=np.float64)
         R = R_bc @ R_wc @ R_bc.T
         sy = float(np.hypot(R[0, 0], R[1, 0]))
         if sy > 1e-6:
-            roll = float(np.rad2deg(np.arctan2(R[2, 1], R[2, 2])))
-            pitch = float(np.rad2deg(np.arctan2(-R[2, 0], sy)))
+            roll = float(np.rad2deg(np.arctan2(-R[2, 0], sy)))
+            pitch = float(np.rad2deg(np.arctan2(R[2, 1], R[2, 2])))
             yaw = float(np.rad2deg(np.arctan2(R[1, 0], R[0, 0])))
         else:
-            roll = float(np.rad2deg(np.arctan2(-R[1, 2], R[1, 1])))
-            pitch = float(np.rad2deg(np.arctan2(-R[2, 0], sy)))
+            roll = float(np.rad2deg(np.arctan2(-R[2, 0], sy)))
+            pitch = float(np.rad2deg(np.arctan2(-R[1, 2], R[1, 1])))
             yaw = 0.0
         return roll, pitch, yaw
 

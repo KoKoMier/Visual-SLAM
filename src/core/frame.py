@@ -40,7 +40,8 @@ class Frame:
         "map_points", "outliers",
         "T_cw", "has_pose",
         "v_w", "bg", "ba", "R_cw_imu_prior",
-        "ref_kf",
+        "ref_kf", "prev_frame", "last_kf",
+        "imu_preintegrated", "imu_preintegrated_frame",
         "scale_factors", "inv_scale_factors",
         "level_sigma2", "inv_level_sigma2",
         "grid_element_width_inv", "grid_element_height_inv",
@@ -109,6 +110,10 @@ class Frame:
         self.ba = np.zeros(3, dtype=np.float64)
         self.R_cw_imu_prior = None
         self.ref_kf = None
+        self.prev_frame = None
+        self.last_kf = None
+        self.imu_preintegrated = None
+        self.imu_preintegrated_frame = None
 
         # 金字塔尺度因子与不确定度权重 (ORB-SLAM3 标准 8 层金字塔, 缩放比 1.2)
         if scale_factors is None:
@@ -152,6 +157,34 @@ class Frame:
     def get_pose_inverse(self) :
         """返回 T_wc (相机到世界变换)"""
         return self.T_cw.inverse()
+
+    def get_imu_rotation(self) :
+        """返回 IMU Body 在世界系下的旋转 R_wb = R_wc * R_cb (对应 ORB-SLAM3 Frame::GetImuRotation)"""
+        R_bc = self.camera.T_b_c1[:3, :3]
+        R_cb = R_bc.T
+        return self.T_cw.R.T @ R_cb
+
+    def get_imu_position(self) :
+        """返回 IMU Body 在世界系下的位置 t_wb = R_wc * t_cb + t_wc (对应 ORB-SLAM3 Frame::GetImuPosition)"""
+        R_bc = self.camera.T_b_c1[:3, :3]
+        t_bc = self.camera.T_b_c1[:3, 3]
+        t_cb = -(R_bc.T @ t_bc)
+        R_wc = self.T_cw.R.T
+        t_wc = -(R_wc @ self.T_cw.t)
+        return R_wc @ t_cb + t_wc
+
+    def set_imu_pose_velocity(self, R_wb, t_wb, v_wb) :
+        """由 IMU Body 位姿 (R_wb, t_wb) 与速度 v_wb 更新相机位姿 T_cw (对应 ORB-SLAM3 Frame::SetImuPoseVelocity)"""
+        R_bc = self.camera.T_b_c1[:3, :3]
+        t_bc = self.camera.T_b_c1[:3, 3]
+        R_cb = R_bc.T
+        t_cb = -(R_cb @ t_bc)
+        R_bw = R_wb.T
+        t_bw = -(R_bw @ t_wb)
+        R_cw = R_cb @ R_bw
+        t_cw = R_cb @ t_bw + t_cb
+        self.set_pose(SE3(R_cw, t_cw))
+        self.v_w = np.asarray(v_wb, dtype=np.float64).reshape(3).copy()
 
     def unproject_stereo(self, i) :
         """

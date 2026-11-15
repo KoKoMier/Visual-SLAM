@@ -911,7 +911,7 @@ def run_live_hardware_slam(
     concat_width = 1280,
     height = 480,
     imu_port = "COM3",
-    imu_baud = 9600,
+    imu_baud = 115200,
     calib_json = "config/custom_stereo_imu.json",
     max_frames = 0,
     output_dir = "outputs",
@@ -948,7 +948,7 @@ def run_live_hardware_slam(
         gyro0 = imu_snap["gyro_rads"]
         eul0 = imu_snap["euler_deg"]
         print(
-            f"  [IMU   ] 已连接串口 {imu_snap['port']} @ {imu_snap['baud']} bps | 已收包: {imu_snap['total_packets']} | "
+            f"  [IMU   ] 已连接串口 {imu_snap['port']} @ {imu_snap['baud']} bps ({imu_snap.get('rate_hz', 200)}Hz) | 已收包: {imu_snap['total_packets']} | "
             f"温度: {imu_snap['temp_c']:.2f} °C"
         )
         print(
@@ -979,6 +979,7 @@ def run_live_hardware_slam(
             "cy": float(stream.camera.cy),
             "imu_port": str(imu_snap.get("port", imu_port)),
             "imu_baud": int(imu_snap.get("baud", imu_baud)),
+            "imu_rate_hz": int(imu_snap.get("rate_hz", 200)),
             "imu_connected": bool(imu_snap.get("connected", False)),
         },
     )
@@ -1001,8 +1002,8 @@ def run_live_hardware_slam(
         cr, sr = np.cos(r), np.sin(r)
         cp, sp = np.cos(p), np.sin(p)
         cy, sy = np.cos(y), np.sin(y)
-        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
-        Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]], dtype=np.float64)
+        Ry = np.array([[cr, 0.0, sr], [0.0, 1.0, 0.0], [-sr, 0.0, cr]], dtype=np.float64)
         Rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
         return Rz @ Ry @ Rx
 
@@ -1059,7 +1060,7 @@ def run_live_hardware_slam(
                 lines_right = [
                     "MONOCULAR + IMU TIGHTLY-COUPLED VIO",
                     f"Camera Device : USB Camera ID={stream.cam_id} ({stream.half_w}x{height})",
-                    f"Serial IMU    : {imu_status['port']} @ {imu_status['baud']} bps (Packets={imu_status['total_packets']})",
+                    f"Serial IMU    : {imu_status['port']} @ {imu_status['baud']} bps / {imu_status.get('rate_hz', 200)}Hz (Pkts={imu_status['total_packets']})",
                     f"Tracker State : {slam.tracker.state.name}  |  Inliers: {rec.inlier_count}",
                     f"Active Map    : KeyFrames = {rec.num_keyframes}  |  3D MapPoints = {rec.num_mappoints}",
                     f"Camera Pos (m): X={rec.t_wc_raw[0]:+.3f}, Y={rec.t_wc_raw[1]:+.3f}, Z={rec.t_wc_raw[2]:+.3f}",
@@ -1252,17 +1253,28 @@ def main() :
     parser = argparse.ArgumentParser(description="Phase 1 Stereo/Stereo-Inertial/Monocular SLAM Validation")
     parser.add_argument("--euroc", type=str, default="", help="Path to EuRoC mav0 directory (optional)")
     parser.add_argument("--mono", action="store_true", help="Run pure Monocular mode (single camera only, no IMU)")
-    parser.add_argument("--mono_imu", action="store_true", help="Run Monocular + IMU tightly-coupled VIO mode")
+    parser.add_argument("--mono_imu", "--mono-imu", dest="mono_imu", action="store_true", help="Run Monocular + IMU tightly-coupled VIO mode")
     parser.add_argument("--live", action="store_true", help="Run live USB Camera (Stereo or Monocular) + Serial IMU mode")
+    parser.add_argument("--mode", type=str, default="", help="Run mode alias (e.g. 'live', 'mono', 'mono_imu', 'history')")
     parser.add_argument("--history", action="store_true", help="Review historical blackbox run logs and exit")
-    parser.add_argument("--cam_id", type=int, default=-1, help="USB camera device ID (-1 for auto-detect)")
-    parser.add_argument("--imu_port", type=str, default="COM3", help="Serial port for IMU (auto-scans COM4/COM3)")
-    parser.add_argument("--imu_baud", type=int, default=9600, help="Baud rate for serial IMU (default 9600)")
+    parser.add_argument("--cam_id", "--cam-id", dest="cam_id", type=int, default=-1, help="USB camera device ID (-1 for auto-detect)")
+    parser.add_argument("--imu_port", "--imu-port", dest="imu_port", type=str, default="COM3", help="Serial port for IMU (auto-scans COM4/COM3)")
+    parser.add_argument("--imu_baud", "--imu-baud", dest="imu_baud", type=int, default=115200, help="Baud rate for serial IMU (default 115200, auto-negotiates 9600->115200 @ 200Hz)")
     parser.add_argument("--calib", type=str, default="config/custom_stereo_imu.json", help="Calibration JSON path")
     parser.add_argument("--show", action="store_true", help="Show live OpenCV HUD window during --live mode")
-    parser.add_argument("--max_frames", type=int, default=80, help="Number of frames to process (for dataset/synthetic modes)")
-    parser.add_argument("--output_dir", type=str, default="outputs", help="Unified directory for all output files")
+    parser.add_argument("--max_frames", "--max-frames", dest="max_frames", type=int, default=80, help="Number of frames to process (for dataset/synthetic modes)")
+    parser.add_argument("--output_dir", "--output-dir", dest="output_dir", type=str, default="outputs", help="Unified directory for all output files")
     args = parser.parse_args()
+
+    mode_str = args.mode.strip().lower()
+    if mode_str == "live":
+        args.live = True
+    elif mode_str == "history":
+        args.history = True
+    elif mode_str in ("mono_imu", "mono-imu"):
+        args.mono_imu = True
+    elif mode_str == "mono":
+        args.mono = True
 
     if args.history:
         print_blackbox_history(output_dir=args.output_dir)
